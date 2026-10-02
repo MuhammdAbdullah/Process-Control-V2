@@ -411,23 +411,39 @@
       if (data && data.info) {
         setBannerSuccess(data.info.name);
         // main.js handles loadFile after 1200ms delay — no action needed here
-      } else if (data && data.id === 0) {
-        setBannerConnected(); // no ID — show assign UI
+      } else if (data) {
+        // Unrecognized/unassigned ID (e.g. factory-default 200, or 0) — show assign UI
+        setBannerConnected();
       }
     });
   }
 
   // ── Assign ID button ──
-  assignBtn.addEventListener('click', () => {
+  assignBtn.addEventListener('click', async () => {
     const id = parseInt(assignSel.value, 10);
-    if (!isNaN(id) && window.electronAPI) {
-      window.electronAPI.sendCustomJson({ A: id }, 'assign-hardware-id');
-      assignBtn.disabled = true;
-      assignBtn.textContent = 'Sending…';
-      setTimeout(() => {
-        assignBtn.disabled = false;
-        assignBtn.textContent = 'Assign ID to Hardware';
-      }, 2000);
+    if (isNaN(id) || !window.electronAPI) return;
+
+    assignBtn.disabled = true;
+    assignBtn.textContent = 'Sending…';
+    try {
+      const result = await window.electronAPI.sendCustomJson({ A: id }, 'assign-hardware-id');
+      if (!result || result.success === false) {
+        bannerSub.textContent = `Assign failed: ${(result && result.error) || 'unknown error'} — check the connection and try again`;
+      } else {
+        // Firmware only reports its ID in response to a REQ_ID request (no
+        // broadcast after a plain assign) — ask a couple of times so a missed
+        // first reply doesn't strand the UI without navigating.
+        [300, 1500].forEach(delay => {
+          setTimeout(() => {
+            window.electronAPI.sendCustomJson({ REQ_ID: 1 }, 'confirm-hardware-id').catch(() => {});
+          }, delay);
+        });
+      }
+    } catch (err) {
+      bannerSub.textContent = `Assign failed: ${err.message} — check the connection and try again`;
+    } finally {
+      assignBtn.disabled = false;
+      assignBtn.textContent = 'Assign ID to Hardware';
     }
   });
 

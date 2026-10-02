@@ -67,14 +67,20 @@ let bootloaderResponseData = null; // Store the response data
 let serialWriteQueue = Promise.resolve(); // Keep serial writes in order
 let lastSerialWriteTime = 0; // Prevent command flooding
 let reconnectInProgress = false;
+let reconnectFailureStreak = 0;
+let lastReconnectAttemptTime = 0;
 let activeSerialPath = null;
 let activeSerialBaudRate = 115200;
 const SERIAL_MIN_COMMAND_INTERVAL_MS = 40;
+const QL_HEARTBEAT_INTERVAL_MS = 100; // 10 Hz telemetry requests; firmware transmit timer also runs at 100 ms.
 let portsPollIntervalId = null;
 let connectionMonitorIntervalId = null;
 let qlHeartbeatIntervalId = null;
 let qlHeartbeatInFlight = false;
 let qlHeartbeatFailureCount = 0;
+let activeHardwareType = 'temperature'; // updated when hardware ID is received
+let hardwareIdReceivedThisConnection = false; // reset per connect; set true once an {A:...} reply arrives
+let connectionGeneration = 0; // bumped on every connectSerial() call; lets stale async loops detect they've been superseded
 let lastKnownPorts = [];
 let isConnected = false;
 let lastDataTime = 0;
@@ -226,27 +232,30 @@ function createWindow() {
         });
         await new Promise(resolve => setTimeout(resolve, 200));
 
-        // 4. Target temperature to 20°C (safe minimum - hardware expects 20-70°C range)
-        console.log('[SHUTDOWN] Setting target temperature to 20°C...');
-        const heaterTempJson = JSON.stringify({ T: 20 });
-        const heaterTempPayload = Buffer.from(heaterTempJson + '\n', 'utf8');
-        await new Promise((resolve, reject) => {
-          serialPort.write(heaterTempPayload, (err) => {
-            if (err) reject(err); else resolve();
+        // 4. Setpoint to safe idle value (temperature-specific: 20°C min; all others: 0)
+        if (activeHardwareType === 'temperature') {
+          console.log('[SHUTDOWN] Setting target temperature to 20°C...');
+          const heaterTempPayload = Buffer.from(JSON.stringify({ T: 20 }) + '\n', 'utf8');
+          await new Promise((resolve, reject) => {
+            serialPort.write(heaterTempPayload, (err) => { if (err) reject(err); else resolve(); });
           });
-        });
-        await new Promise(resolve => setTimeout(resolve, 200));
+          await new Promise(resolve => setTimeout(resolve, 200));
 
-        // 5. Heater off
-        console.log('[SHUTDOWN] Turning heater OFF...');
-        const heaterOffJson = JSON.stringify({ H: 0 });
-        const heaterOffPayload = Buffer.from(heaterOffJson + '\n', 'utf8');
-        await new Promise((resolve, reject) => {
-          serialPort.write(heaterOffPayload, (err) => {
-            if (err) reject(err); else resolve();
+          // 5. Heater off (temperature only)
+          console.log('[SHUTDOWN] Turning heater OFF...');
+          const heaterOffPayload = Buffer.from(JSON.stringify({ H: 0 }) + '\n', 'utf8');
+          await new Promise((resolve, reject) => {
+            serialPort.write(heaterOffPayload, (err) => { if (err) reject(err); else resolve(); });
           });
-        });
-        await new Promise(resolve => setTimeout(resolve, 200));
+          await new Promise(resolve => setTimeout(resolve, 200));
+        } else {
+          console.log(`[SHUTDOWN] Setting setpoint to 0 (${activeHardwareType})...`);
+          const setpointPayload = Buffer.from(JSON.stringify({ T: 0 }) + '\n', 'utf8');
+          await new Promise((resolve, reject) => {
+            serialPort.write(setpointPayload, (err) => { if (err) reject(err); else resolve(); });
+          });
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
 
         // 6. PID P value to 0
         console.log('[SHUTDOWN] Setting PID P to 0...');
@@ -908,6 +917,8 @@ async function connectSerial(portPath, baudRate) {
                 const hwId = jsonData.A;
                 const hwInfo = HARDWARE_ID_MAP[hwId];
                 console.log(`🔌 Hardware ID received: ${hwId}${hwInfo ? ` → ${hwInfo.name}` : ' (unassigned)'}`);
+                hardwareIdReceivedThisConnection = true;
+                if (hwInfo) activeHardwareType = hwInfo.type;
                 if (mainWindow && !mainWindow.isDestroyed()) {
                   mainWindow.webContents.send('hardware-id-received', { id: hwId, info: hwInfo || null });
                   if (hwInfo) {
@@ -1001,6 +1012,16 @@ async function connectSerial(portPath, baudRate) {
     // Send connection status to all windows
     sendConnectionStatusToAllWindows({ connected: true, port: portPath, baudRate: baudRate });
     startQlHeartbeat();
+    // Firmware only reports its hardware ID in response to {REQ_ID: 1} (the
+    // boot-time broadcast is compiled out) — ask so already-assigned hardware
+    // auto-routes. A persistent poll (tried and reverted) destabilized the USB
+    // CDC link — heartbeat writes started timing out and Windows threw hard
+    // errors ("Unknown error code 31" / "Access denied" on reopen). Instead,
+    // retry a few times with backoff: right after enumeration the firmware's
+    // CDC stack may not yet be servicing writes, so a single shot can be missed.
+    hardwareIdReceivedThisConnection = false;
+    const myGeneration = ++connectionGeneration;
+    requestHardwareIdWithRetry(portPath, myGeneration);
 
     return { success: true, port: portPath, baudRate: baudRate };
   } catch (error) {
@@ -1196,6 +1217,8 @@ function waitMs(delay) {
   return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
+const QL_HEARTBEAT_FAILURE_THRESHOLD = 20; // ~2s of continuous 10 Hz failures before attempting recovery
+
 function startQlHeartbeat() {
   if (qlHeartbeatIntervalId) {
     return;
@@ -1211,19 +1234,31 @@ function startQlHeartbeat() {
 
     qlHeartbeatInFlight = true;
     try {
-      await sendJsonCommand({ QL: 1 }, 'QL heartbeat');
+      // Write directly rather than via sendJsonCommand: that helper triggers a
+      // full reconnect (close+reopen the port) on the very first write failure.
+      // A single heartbeat hiccup (brief USB/COM buffer jitter) is common and
+      // recoverable on its own — reconnecting immediately aborts any other
+      // in-flight write and can spiral into a reconnect storm. Only escalate
+      // to a real reconnect after several consecutive failures.
+      const jsonCommand = JSON.stringify({ QL: 1 });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      await writeToSerialWithTimeout(payload, 1500, 'QL heartbeat');
       qlHeartbeatFailureCount = 0;
     } catch (error) {
       qlHeartbeatFailureCount += 1;
       if (qlHeartbeatFailureCount === 1 || qlHeartbeatFailureCount % 20 === 0) {
         console.log(`[HEARTBEAT] QL send failed (${qlHeartbeatFailureCount}): ${error.message}`);
       }
+      if (qlHeartbeatFailureCount >= QL_HEARTBEAT_FAILURE_THRESHOLD) {
+        console.log(`[HEARTBEAT] ${qlHeartbeatFailureCount} consecutive failures — attempting recovery`);
+        await recoverSerialConnection();
+      }
     } finally {
       qlHeartbeatInFlight = false;
     }
-  }, 900);
+  }, QL_HEARTBEAT_INTERVAL_MS);
 
-  console.log('[HEARTBEAT] Started QL heartbeat (900ms)');
+  console.log(`[HEARTBEAT] Started QL heartbeat (${QL_HEARTBEAT_INTERVAL_MS}ms)`);
 }
 
 function stopQlHeartbeat() {
@@ -1253,18 +1288,32 @@ async function recoverSerialConnection() {
     return !!(serialPort && serialPort.isOpen);
   }
 
+  // Back off between attempts: a real power-cycle/USB re-enumeration takes
+  // Windows several seconds to settle, and retrying at the 900ms heartbeat
+  // cadence just spams "Access denied" / "Unknown error code 31" into that
+  // window instead of waiting it out.
+  const backoffMs = Math.min(1000 * (2 ** reconnectFailureStreak), 8000);
+  const sinceLastAttempt = Date.now() - lastReconnectAttemptTime;
+  if (lastReconnectAttemptTime && sinceLastAttempt < backoffMs) {
+    await waitMs(backoffMs - sinceLastAttempt);
+  }
+
   reconnectInProgress = true;
+  lastReconnectAttemptTime = Date.now();
   try {
     console.log(`[SERIAL] Attempting auto-reconnect to ${activeSerialPath}...`);
     const result = await connectSerial(activeSerialPath, activeSerialBaudRate);
     if (!result || !result.success) {
-      console.log('[SERIAL] Auto-reconnect failed');
+      reconnectFailureStreak += 1;
+      console.log(`[SERIAL] Auto-reconnect failed (streak ${reconnectFailureStreak})`);
       return false;
     }
+    reconnectFailureStreak = 0;
     console.log('[SERIAL] Auto-reconnect succeeded');
     return true;
   } catch (error) {
-    console.error('[SERIAL] Auto-reconnect error:', error.message);
+    reconnectFailureStreak += 1;
+    console.error(`[SERIAL] Auto-reconnect error (streak ${reconnectFailureStreak}):`, error.message);
     return false;
   } finally {
     reconnectInProgress = false;
@@ -1314,6 +1363,37 @@ function writeToSerialWithTimeout(payload, timeoutMs, description) {
       });
     });
   });
+}
+
+async function requestHardwareIdWithRetry(portPath, generation) {
+  // Deliberately does NOT go through sendJsonCommand: that helper calls
+  // recoverSerialConnection() (a full reconnect) on any write failure, and
+  // connectSerial()'s success path re-arms this same loop — so a write that
+  // fails right after connect (CDC not settled yet) can spiral into repeated
+  // reconnects that each re-trigger the loop, hammering the port until Windows
+  // drops it. Failures here just log and wait for the next scheduled retry.
+  const delaysMs = [500, 1200, 2500];
+  for (let attempt = 0; attempt < delaysMs.length; attempt++) {
+    await waitMs(delaysMs[attempt]);
+    // Bail if a newer connection/reconnect has superseded this loop, the port
+    // changed, or the ID already arrived while we were waiting.
+    if (
+      hardwareIdReceivedThisConnection ||
+      generation !== connectionGeneration ||
+      !serialPort || !serialPort.isOpen ||
+      activeSerialPath !== portPath
+    ) {
+      return;
+    }
+    try {
+      const jsonCommand = JSON.stringify({ REQ_ID: 1 });
+      const payload = Buffer.from(jsonCommand + '\n', 'utf8');
+      await writeToSerialWithTimeout(payload, 1500, `ID request (attempt ${attempt + 1})`);
+      console.log(`[TX] ID request (attempt ${attempt + 1}): ${jsonCommand}`);
+    } catch (error) {
+      console.log(`[ID_REQUEST] Send failed (attempt ${attempt + 1}): ${error.message}`);
+    }
+  }
 }
 
 async function sendJsonCommand(commandObject, description) {
@@ -1754,6 +1834,19 @@ ipcMain.handle('write-file', async (event, filePath, content) => {
     return { success: true };
   } catch (error) {
     console.error('Error writing file:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// IPC handler for appending to a file (used for incremental CSV row writes so
+// data already on disk survives a sudden app close instead of only living in
+// renderer memory until the user presses Stop).
+ipcMain.handle('append-file', async (event, filePath, content) => {
+  try {
+    await fs.appendFile(filePath, content, 'utf8');
+    return { success: true };
+  } catch (error) {
+    console.error('Error appending to file:', error);
     return { success: false, error: error.message };
   }
 });

@@ -11,6 +11,7 @@ const app = express();
 const TARGET_VENDOR_ID = '12BF';
 const TARGET_PRODUCT_ID = '0113';
 const SERIAL_MIN_COMMAND_INTERVAL_MS = 40;
+const QL_HEARTBEAT_INTERVAL_MS = 100; // 10 Hz telemetry requests for fast Level response logging.
 
 // Serial state
 let serialPort = null;
@@ -22,6 +23,7 @@ let serialWriteQueue = Promise.resolve();
 let lastSerialWriteTime = 0;
 let autoConnectRetryTimer = null;
 let qlHeartbeatTimer = null;
+let qlHeartbeatInFlight = false;
 
 // SSE clients — each entry is an Express response object with SSE headers set
 let sseClients = [];
@@ -221,10 +223,13 @@ function handleSerialData(data) {
 function startQlHeartbeat() {
     stopQlHeartbeat();
     qlHeartbeatTimer = setInterval(async () => {
+        if (qlHeartbeatInFlight) return;
         if (!isConnected || !serialPort || !serialPort.isOpen) return;
+        qlHeartbeatInFlight = true;
         try { await sendJsonCommand({ QL: 1 }, 'heartbeat'); } catch { /* ignore */ }
-    }, 900);
-    console.log('[HEARTBEAT] QL heartbeat started');
+        finally { qlHeartbeatInFlight = false; }
+    }, QL_HEARTBEAT_INTERVAL_MS);
+    console.log(`[HEARTBEAT] QL heartbeat started (${QL_HEARTBEAT_INTERVAL_MS}ms)`);
 }
 
 function stopQlHeartbeat() {
@@ -232,6 +237,7 @@ function stopQlHeartbeat() {
         clearInterval(qlHeartbeatTimer);
         qlHeartbeatTimer = null;
     }
+    qlHeartbeatInFlight = false;
 }
 
 async function connectSerial(portPath, baudRate) {

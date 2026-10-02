@@ -225,16 +225,6 @@
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════
-     TOP APP TAB BAR
-════════════════════════════════════════════════════════════════ -->
-<div id="top-tab-bar-container" class="bg-base-200 border-b border-base-300 flex-shrink-0 px-2 py-1">
-    <div class="tabs tabs-boxed bg-transparent gap-1" id="app-tab-bar">
-        <button class="tab tab-active font-semibold" data-app="main">🌡️ Main App</button>
-        <button class="tab font-semibold" data-app="curriculum">📚 Curriculum</button>
-    </div>
-</div>
-
-<!-- ═══════════════════════════════════════════════════════════
      BODY  (sidebar + main content)
 ════════════════════════════════════════════════════════════════ -->
 <div class="flex flex-1 md:overflow-hidden relative">
@@ -255,6 +245,13 @@
         <div class="flex justify-end p-3 md:hidden border-b border-base-300 flex-shrink-0">
             <button id="sidebar-close-btn" class="btn btn-ghost btn-sm btn-square">✕</button>
         </div>
+
+        <!-- ── APP SWITCHER (always visible, not hidden by app menu toggling) ── -->
+        <ul class="menu p-3 gap-1 flex-shrink-0 border-b border-base-300" id="sidebar-apps">
+            <li><a href="#" data-page="pct-main" data-app="main" class="sidebar-link">🌡️ Main App</a></li>
+            <li><a href="#" data-page="ws-1" data-app="curriculum" class="sidebar-link">📚 Curriculum</a></li>
+            <li><a href="#" data-page="admin" data-app="admin" class="sidebar-link">🔧 Admin</a></li>
+        </ul>
 
         <!-- Scrollable menu -->
         <div class="flex-1 overflow-y-auto overscroll-contain">
@@ -284,8 +281,6 @@
                     </details>
                 </li>
 
-                <li class="menu-title mt-2">Tools</li>
-                <li><a href="#" data-page="admin" data-app="admin" class="sidebar-link">🔧 Admin</a></li>
             </ul>
 
             <!-- ── ADMIN menu (hidden initially) ── -->
@@ -553,7 +548,7 @@
                     <div class="card bg-base-300 shadow pid-params">
                         <div class="card-body p-4 gap-3">
                             <div class="text-xs font-bold tracking-widest uppercase opacity-50">PID Parameters</div>
-                            <div class="flex items-center gap-2">
+                            <div class="hidden flex items-center gap-2">
                                 <span class="text-xs font-semibold opacity-70 w-28 flex-shrink-0">Control Type:</span>
                                 <select id="pidControlType" class="select select-bordered select-sm flex-1">
                                     <option value="P">P (Proportional)</option>
@@ -592,7 +587,6 @@
                                 </select>
                             </div>
                             <div class="flex gap-2 pt-1">
-                                <button id="pidCommitBtn" class="btn btn-primary btn-sm flex-1">Commit</button>
                                 <button id="pidResetBtn"  class="btn btn-ghost btn-sm flex-1">Reset</button>
                             </div>
                         </div>
@@ -738,6 +732,17 @@
                         <div class="card-body gap-4">
                             <h2 class="card-title text-base border-b border-success pb-3">🎛️ PID Control Settings</h2>
                             <div class="space-y-1">
+                                <label class="label pb-0" for="adminPidProduct"><span class="label-text font-semibold">Product:</span></label>
+                                <select id="adminPidProduct" class="select select-bordered select-sm w-full">
+                                    <option value="temperature">201 — Temperature</option>
+                                    <option value="pressure">202 — Pressure</option>
+                                    <option value="level">203 — Level</option>
+                                    <option value="flow">204 — Flow</option>
+                                    <option value="servo-speed">205 — Servo Speed</option>
+                                    <option value="servo-angle">206 — Servo Angle</option>
+                                </select>
+                            </div>
+                            <div class="space-y-1">
                                 <label class="label pb-0" for="proportionalInput">
                                     <span class="label-text font-semibold">Proportional (P):</span>
                                 </label>
@@ -767,9 +772,12 @@
                                     <span class="pid-status" id="differentialStatus"></span>
                                 </div>
                             </div>
+                            <div class="space-y-1">
+                                <label class="label pb-0" for="adminPidFrequency"><span class="label-text font-semibold">Frequency (Hz):</span></label>
+                                <input type="number" id="adminPidFrequency" min="0.2" max="1000" step="0.01" class="input input-bordered input-sm w-full">
+                            </div>
                             <p class="text-xs text-base-content/50 mt-1">
-                                These values are used as starting defaults when switching PID control types.
-                                Changes are saved automatically and applied on next startup.
+                                Values are saved as defaults for the selected product and sent when that product enters PID mode.
                             </p>
                             <div class="card-actions justify-end mt-2">
                                 <button id="pidRestoreDefaultsBtn" class="btn btn-sm btn-outline btn-warning">
@@ -2676,19 +2684,46 @@
 
     const PID_FACTORY_DEFAULTS = { P: 3.162, I: 0.01, D: 150 };
 
+    const PID_PRODUCT_DEFAULTS = {
+        temperature: { P: 3.162, I: 0.01, D: 150, frequency: 1 },
+        pressure: { P: 5, I: 0.5, D: 0, frequency: 5 },
+        level: { P: 3.162, I: 0.01, D: 150, frequency: 5 },
+        flow: { P: 3.162, I: 0.01, D: 150, frequency: 1 },
+        'servo-speed': { P: 1.5, I: 250, D: 0.02, frequency: 250 },
+        'servo-angle': { P: 0.7, I: 2, D: 0.09, frequency: 250 }
+    };
+
+    function selectedPIDProduct() {
+        var select = document.getElementById('adminPidProduct');
+        return select ? select.value : 'temperature';
+    }
+
+    function saveProductPIDValue(type, term, value) {
+        localStorage.setItem('pid-' + type + '-' + term, String(value));
+        if (type === 'temperature' && term !== 'frequency') {
+            localStorage.setItem('pid-default-' + term, String(value));
+        }
+    }
+
     function loadAdminPIDDefaults() {
-        var pVal = localStorage.getItem('admin-pid-P');
-        var iVal = localStorage.getItem('admin-pid-I');
-        var dVal = localStorage.getItem('admin-pid-D');
-        var p = pVal !== null ? parseFloat(pVal) : PID_FACTORY_DEFAULTS.P;
-        var i = iVal !== null ? parseFloat(iVal) : PID_FACTORY_DEFAULTS.I;
-        var d = dVal !== null ? parseFloat(dVal) : PID_FACTORY_DEFAULTS.D;
+        var type = selectedPIDProduct();
+        var defaults = PID_PRODUCT_DEFAULTS[type] || PID_FACTORY_DEFAULTS;
+        function stored(term, fallback) {
+            var value = parseFloat(localStorage.getItem('pid-' + type + '-' + term));
+            return isNaN(value) ? fallback : value;
+        }
+        var p = stored('P', defaults.P);
+        var i = stored('I', defaults.I);
+        var d = stored('D', defaults.D);
+        var frequency = stored('frequency', defaults.frequency || 1);
         var pIn = document.getElementById('proportionalInput');
         var iIn = document.getElementById('integralInput');
         var dIn = document.getElementById('differentialInput');
+        var fIn = document.getElementById('adminPidFrequency');
         if (pIn) { pIn.value = p; lastProportionalValue = String(p); }
         if (iIn) { iIn.value = i; lastIntegralValue = String(i); }
         if (dIn) { dIn.value = d; lastDifferentialValue = String(d); }
+        if (fIn) fIn.value = frequency;
     }
 
     async function sendAdminPIDValue(type, value) {
@@ -3127,17 +3162,21 @@
 
         loadAdminPIDDefaults();
 
+        var adminPidProduct = document.getElementById('adminPidProduct');
+        if (adminPidProduct) {
+            adminPidProduct.addEventListener('change', function () {
+                loadAdminPIDDefaults();
+                addAdminLog('Loaded PID defaults for ' + adminPidProduct.options[adminPidProduct.selectedIndex].text, 'info');
+            });
+        }
+
         var proportionalInput = document.getElementById('proportionalInput');
         if (proportionalInput) {
             proportionalInput.addEventListener('change', async function () {
                 var v = this.value.trim();
                 if (v !== lastProportionalValue && v !== '') {
                     lastProportionalValue = v;
-                    localStorage.setItem('admin-pid-P', v);
-                    try {
-                        if (window.electronAPI && window.electronAPI.sendCustomJson)
-                            await window.electronAPI.sendCustomJson({ Q: parseFloat(v) }, 'Admin P');
-                    } catch (_) {}
+                    saveProductPIDValue(selectedPIDProduct(), 'P', v);
                     updatePIDStatus('proportional', true, 'Saved');
                 }
             });
@@ -3148,11 +3187,7 @@
                 var v = this.value.trim();
                 if (v !== lastIntegralValue && v !== '') {
                     lastIntegralValue = v;
-                    localStorage.setItem('admin-pid-I', v);
-                    try {
-                        if (window.electronAPI && window.electronAPI.sendCustomJson)
-                            await window.electronAPI.sendCustomJson({ R: parseFloat(v) }, 'Admin I');
-                    } catch (_) {}
+                    saveProductPIDValue(selectedPIDProduct(), 'I', v);
                     updatePIDStatus('integral', true, 'Saved');
                 }
             });
@@ -3163,12 +3198,19 @@
                 var v = this.value.trim();
                 if (v !== lastDifferentialValue && v !== '') {
                     lastDifferentialValue = v;
-                    localStorage.setItem('admin-pid-D', v);
-                    try {
-                        if (window.electronAPI && window.electronAPI.sendCustomJson)
-                            await window.electronAPI.sendCustomJson({ S: parseFloat(v) }, 'Admin D');
-                    } catch (_) {}
+                    saveProductPIDValue(selectedPIDProduct(), 'D', v);
                     updatePIDStatus('differential', true, 'Saved');
+                }
+            });
+        }
+
+        var adminPidFrequency = document.getElementById('adminPidFrequency');
+        if (adminPidFrequency) {
+            adminPidFrequency.addEventListener('change', function () {
+                var v = parseFloat(this.value);
+                if (!isNaN(v) && v > 0) {
+                    saveProductPIDValue(selectedPIDProduct(), 'frequency', v);
+                    updatePIDStatus('proportional', true, 'Saved');
                 }
             });
         }
@@ -3177,18 +3219,17 @@
         var pidRestoreStatus = document.getElementById('pidRestoreStatus');
         if (pidRestoreDefaultsBtn) {
             pidRestoreDefaultsBtn.addEventListener('click', function () {
-                var p = PID_FACTORY_DEFAULTS.P, i = PID_FACTORY_DEFAULTS.I, d = PID_FACTORY_DEFAULTS.D;
-                localStorage.setItem('admin-pid-P', p);
-                localStorage.setItem('admin-pid-I', i);
-                localStorage.setItem('admin-pid-D', d);
-                var pIn = document.getElementById('proportionalInput');
-                var iIn = document.getElementById('integralInput');
-                var dIn = document.getElementById('differentialInput');
-                if (pIn) { pIn.value = p; lastProportionalValue = String(p); }
-                if (iIn) { iIn.value = i; lastIntegralValue = String(i); }
-                if (dIn) { dIn.value = d; lastDifferentialValue = String(d); }
-                if (pidRestoreStatus) { pidRestoreStatus.textContent = 'Restored to P='+p+', I='+i+', D='+d; setTimeout(function(){ pidRestoreStatus.textContent=''; }, 4000); }
-                addAdminLog('PID defaults restored to factory values: P='+p+', I='+i+', D='+d, 'success');
+                var type = selectedPIDProduct();
+                ['P', 'I', 'D', 'frequency'].forEach(function (term) { localStorage.removeItem('pid-' + type + '-' + term); });
+                loadAdminPIDDefaults();
+                var p = parseFloat(document.getElementById('proportionalInput').value) || 0;
+                var i = parseFloat(document.getElementById('integralInput').value) || 0;
+                var d = parseFloat(document.getElementById('differentialInput').value) || 0;
+                var frequency = parseFloat(document.getElementById('adminPidFrequency').value) || 0;
+                saveProductPIDValue(type, 'P', p); saveProductPIDValue(type, 'I', i);
+                saveProductPIDValue(type, 'D', d); saveProductPIDValue(type, 'frequency', frequency);
+                if (pidRestoreStatus) { pidRestoreStatus.textContent = 'Restored P='+p+', I='+i+', D='+d+', F='+frequency+' Hz'; setTimeout(function(){ pidRestoreStatus.textContent=''; }, 4000); }
+                addAdminLog('PID defaults restored for ' + type + ': P='+p+', I='+i+', D='+d+', F='+frequency+' Hz', 'success');
             });
         }
     });
@@ -3200,6 +3241,17 @@
     var APP_MENUS = { main: 'sidebar-main', admin: 'sidebar-admin', curriculum: 'sidebar-curriculum' };
     var APP_DEFAULT_PAGES = { main: 'pct-main', admin: 'admin', curriculum: 'ws-1' };
     var ALL_PAGE_IDS = ['pct-main','admin','ws-1','ws-2','ws-3','ws-4','ws-5','ws-6','ws-7','ws-8','ws-9','ws-10'];
+
+    // Maps a hardware type (query param set by renderer-hardware.js when it
+    // sends you here for Curriculum) back to that sensor's own page file.
+    var HW_ORIGIN_PAGES = {
+        pressure:      'pressure.html',
+        level:         'level.html',
+        flow:          'flow.html',
+        'servo-speed': 'servo-speed.html',
+        'servo-angle': 'servo-angle.html'
+    };
+    var CURRICULUM_ORIGIN_KEY = 'pct-curriculum-origin-app';
 
     function setSidebarVisible(visible) {
         var sb = document.getElementById('sidebar');
@@ -3242,7 +3294,7 @@
             var adminLink = document.querySelector('.sidebar-link[data-admin-tab="' + adminTab + '"]');
             if (adminLink) adminLink.classList.add('active');
         } else {
-            var links = document.querySelectorAll('.sidebar-link[data-page="' + pageId + '"]:not([data-control-mode]):not([data-admin-tab])');
+            var links = document.querySelectorAll('.sidebar-link[data-page="' + pageId + '"]:not([data-control-mode]):not([data-admin-tab]):not([data-app])');
             if (links.length) links[0].classList.add('active');
         }
     }
@@ -3251,8 +3303,22 @@
         var backBtn = document.getElementById('adminBackBtn');
         if (backBtn) backBtn.addEventListener('click', function() { switchToApp('main'); });
 
-        // When opened from a hardware page via IPC, switch directly to curriculum
-        if (window.location.hash === '#curriculum') switchToApp('curriculum');
+        // When opened from another sensor page's Curriculum link, remember where
+        // to send "Main App" back to, and switch directly to curriculum.
+        if (window.location.hash === '#curriculum') {
+            var params = new URLSearchParams(window.location.search);
+            var originType = params.get('from');
+            if (originType && HW_ORIGIN_PAGES[originType]) {
+                sessionStorage.setItem(CURRICULUM_ORIGIN_KEY, originType);
+            } else {
+                sessionStorage.removeItem(CURRICULUM_ORIGIN_KEY);
+            }
+            switchToApp('curriculum');
+        } else {
+            // Arrived at the temperature app directly (not via another app's
+            // Curriculum link) — any remembered origin is now stale.
+            sessionStorage.removeItem(CURRICULUM_ORIGIN_KEY);
+        }
 
         // Remote Access card is only meaningful on the PC app (Electron)
         if (!navigator.userAgent.includes('Electron')) {
@@ -3262,21 +3328,24 @@
     });
 
     function switchToApp(appKey) {
-        document.querySelectorAll('#app-tab-bar .tab').forEach(function(t) {
-            t.classList.toggle('tab-active', t.dataset.app === appKey);
-        });
+        if (appKey === 'main') {
+            var originType = sessionStorage.getItem(CURRICULUM_ORIGIN_KEY);
+            if (originType && HW_ORIGIN_PAGES[originType]) {
+                sessionStorage.removeItem(CURRICULUM_ORIGIN_KEY);
+                window._skipDisconnectOnUnload = true;
+                window.location.href = HW_ORIGIN_PAGES[originType];
+                return;
+            }
+        }
         Object.keys(APP_MENUS).forEach(function(app) {
             var menu = document.getElementById(APP_MENUS[app]);
             if (menu) menu.classList.toggle('hidden', app !== appKey);
         });
-        var topBar = document.getElementById('top-tab-bar-container');
-        if (topBar) topBar.classList.toggle('hidden', appKey === 'admin');
         showPage(APP_DEFAULT_PAGES[appKey]);
+        document.querySelectorAll('#sidebar-apps .sidebar-link').forEach(function(t) {
+            t.classList.toggle('active', t.dataset.app === appKey);
+        });
     }
-
-    document.querySelectorAll('#app-tab-bar .tab').forEach(function(tab) {
-        tab.addEventListener('click', function() { switchToApp(tab.dataset.app); });
-    });
 
     document.addEventListener('click', function(e) {
         var link = e.target.closest('.sidebar-link');

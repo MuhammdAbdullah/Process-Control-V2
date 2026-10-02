@@ -16,8 +16,13 @@
   var liveChartRef = null;        // Secondary chart
   var chartDisplayMode = 'all';   // 'limited' | 'all'
   var maxPoints = 50;
+  var CHART_RENDER_INTERVAL_MS = 100; // Keep chart paint work at 10 fps while still processing/logging every sample.
+  var lastChartRenderMs = 0;
+  var chartRenderTimer = null;
   var isSavingCsv = false;
   var csvRows = [];
+  var csvSessionMode = null;
+  var csvSavePath = null; // path chosen at Start (Electron only); rows are appended to disk as they arrive
   var valveOpen = false;
   var lastSetpoint = null;
   var lastHysteresis = 1;
@@ -26,6 +31,7 @@
   // First: {T, P, F}  Second: {Pr, It, Dr, Ot}
   var lastPidValues = { proportional: 0, integral: 0, derivative: 0, output: 0 };
   var currentPidControlType = 'PID'; // 'P' | 'PI' | 'PD' | 'PID'
+  var lastPidFrequency = 1;
 
   var api = window.electronAPI || null;
   var isElectron = !!api;
@@ -36,8 +42,66 @@
   var hexFilePath = '';
   var lastProportionalValue = '', lastIntegralValue = '', lastDifferentialValue = '';
   var wasConnected = false;
+  var hasSeenConnection = false;
   var reconnectTimer = null;
   var PID_FACTORY_DEFAULTS = { P: 3.162, I: 0.01, D: 150 };
+
+  function productPidDefaults() {
+    var configured = CFG.pidDefaults || {};
+    var frequencyEl = el('pidFrequency');
+    return {
+      P: typeof configured.P === 'number' ? configured.P : 3.162,
+      I: typeof configured.I === 'number' ? configured.I : 0.01,
+      D: typeof configured.D === 'number' ? configured.D : 150,
+      frequency: typeof configured.frequency === 'number' ? configured.frequency :
+        (frequencyEl ? parseFloat(frequencyEl.value) || 1 : 1)
+    };
+  }
+
+  function productPidStorageKey(term) {
+    return 'pid-' + CFG.type + '-' + term;
+  }
+
+  function loadProductPidValues() {
+    var defaults = productPidDefaults();
+    var values = {
+      P: parseFloat(localStorage.getItem(productPidStorageKey('P'))),
+      I: parseFloat(localStorage.getItem(productPidStorageKey('I'))),
+      D: parseFloat(localStorage.getItem(productPidStorageKey('D'))),
+      frequency: parseFloat(localStorage.getItem(productPidStorageKey('frequency')))
+    };
+    if (isNaN(values.P)) values.P = defaults.P;
+    if (isNaN(values.I)) values.I = defaults.I;
+    if (isNaN(values.D)) values.D = defaults.D;
+    if (isNaN(values.frequency)) values.frequency = defaults.frequency;
+
+    var p = el('pidPInput'), i = el('pidIInput'), d = el('pidDInput'), f = el('pidFrequency');
+    if (p) p.value = values.P;
+    if (i) i.value = values.I;
+    if (d) d.value = values.D;
+    if (f) f.value = String(values.frequency);
+    lastPidFrequency = values.frequency;
+  }
+
+  function saveProductPidValue(term, value) {
+    if (typeof value === 'number' && !isNaN(value)) {
+      localStorage.setItem(productPidStorageKey(term), String(value));
+    }
+  }
+
+  function resetProductPidValues() {
+    ['P', 'I', 'D', 'frequency'].forEach(function (term) {
+      localStorage.removeItem(productPidStorageKey(term));
+    });
+    loadProductPidValues();
+    commitPID();
+    var frequency = parseFloat((el('pidFrequency') || {}).value);
+    if (!isNaN(frequency) && frequency > 0) {
+      lastPidFrequency = frequency;
+      queueSend({ PID_Hz: frequency }, 'PID Frequency Reset');
+    }
+    addLog('PID defaults restored for ' + CFG.name, 'success');
+  }
 
   // ── DOM helper ────────────────────────────────────────────────────────────────
   function el(id) { return document.getElementById(id); }
@@ -93,30 +157,54 @@
     addLog(msg || (connected ? 'Connected' : 'Disconnected'), connected ? 'success' : 'error');
 
     if (!wasConnected && connected) {
-      // Clear chart data without destroying/recreating (safe during unstable reconnect)
-      if (chartJsRef)  { chartJsRef.data.labels = []; chartJsRef.data.datasets.forEach(function(d) { d.data = []; }); chartJsRef.update(); }
-      if (liveChartRef){ liveChartRef.data.labels = []; liveChartRef.data.datasets.forEach(function(d) { d.data = []; }); liveChartRef.update(); }
+      if (!hasSeenConnection) {
+        hasSeenConnection = true;
 
-      // Reset UI to manual without sending any serial commands yet
-      currentMode = 'manual';
-      skipNextPoint = true;
-      document.querySelectorAll('.mode-btn').forEach(function(btn) {
-        var active = btn.getAttribute('data-mode') === 'manual';
-        btn.classList.toggle('btn-active', active);
-        btn.classList.toggle('btn-primary', active);
-      });
-      ['manual', 'onoff', 'pid'].forEach(function(m) {
-        var panel = el(m + 'ControlMode');
-        if (panel) panel.style.display = m === 'manual' ? 'flex' : 'none';
-      });
+        // Clear chart data without destroying/recreating (safe during unstable reconnect)
+        if (chartJsRef)  { chartJsRef.data.labels = []; chartJsRef.data.datasets.forEach(function(d) { d.data = []; }); chartJsRef.update(); }
+        if (liveChartRef){ liveChartRef.data.labels = []; liveChartRef.data.datasets.forEach(function(d) { d.data = []; }); liveChartRef.update(); }
 
-      // Send C:1 after port stabilises — debounced so reconnect loops don't stack
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(function() {
-        reconnectTimer = null;
-        queueSend({ C: 1 }, 'Control Mode');
-        addLog('Device reconnected — charts cleared, reset to Manual mode', 'info');
-      }, 1000);
+        // Reset UI to manual without sending any serial commands yet
+        currentMode = 'manual';
+        skipNextPoint = true;
+        document.querySelectorAll('.mode-btn').forEach(function(btn) {
+          var active = btn.getAttribute('data-mode') === 'manual';
+          btn.classList.toggle('btn-active', active);
+          btn.classList.toggle('btn-primary', active);
+        });
+        ['manual', 'onoff', 'pid'].forEach(function(m) {
+          var panel = el(m + 'ControlMode');
+          if (panel) panel.style.display = m === 'manual' ? 'flex' : 'none';
+        });
+
+        // Send C:1 after port stabilises — debounced so reconnect loops don't stack
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(function() {
+          reconnectTimer = null;
+          // Firmware only writes the PWM/output register when the incoming value
+          // differs from its last-cached value. Send safe output resets before the
+          // mode command so selecting Manual cannot briefly leave a pump enabled.
+          if (CFG.valveToggle) queueSend({ H: 0 }, 'Valve closed');
+          if (CFG.secondaryOutput) {
+            queueSend({ F: 1 }, CFG.secondaryOutput.label + ' force update');
+            queueSend({ F: 0 }, CFG.secondaryOutput.label);
+          }
+          queueSend({ P: 1 }, CFG.primaryOutput.label + ' force update');
+          queueSend({ P: 0 }, CFG.primaryOutput.label);
+          var safeSetpoint = safeSetpointValue();
+          queueSend({ T: pulseSetpointValue(safeSetpoint) }, 'Setpoint force update');
+          queueSend({ T: safeSetpoint }, 'Setpoint');
+          queueSend({ C: 1 }, 'Control Mode');
+          addLog('Device connected — charts cleared, reset to Manual mode', 'info');
+        }, 1000);
+      } else {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        skipNextPoint = true;
+        addLog('Device reconnected — preserving ' + currentMode.toUpperCase() + ' mode', 'info');
+      }
     }
 
     wasConnected = connected;
@@ -137,6 +225,61 @@
     display.textContent = (typeof val === 'number')
       ? (val.toFixed(1) + ' ' + CFG.sensor.unit)
       : ('-- ' + CFG.sensor.unit);
+  }
+
+  function setControlValue(inputId, displayId, value) {
+    var input = el(inputId);
+    var display = el(displayId);
+    if (input) input.value = value;
+    if (display) display.value = value;
+  }
+
+  function closeValveButtons() {
+    valveOpen = false;
+    ['valveToggleBtn', 'onoffValveBtn', 'pidValveBtn'].forEach(function (id) {
+      var btn = el(id);
+      if (!btn) return;
+      btn.textContent = 'Valve: CLOSED';
+      btn.className = 'btn btn-sm w-full btn-error';
+    });
+  }
+
+  function safeSetpointValue() {
+    if (typeof CFG.safeSetpoint === 'number') return CFG.safeSetpoint;
+    if (CFG.type === 'servo-angle') return 0;
+    return (CFG.sensor && typeof CFG.sensor.min === 'number') ? Math.max(0, CFG.sensor.min) : 0;
+  }
+
+  function pulseSetpointValue(safeSetpoint) {
+    var max = (CFG.sensor && typeof CFG.sensor.max === 'number') ? CFG.sensor.max : safeSetpoint + 1;
+    if (safeSetpoint < max) return safeSetpoint + 1;
+    return safeSetpoint;
+  }
+
+  function resetControlsForModeSwitch() {
+    var safeSetpoint = safeSetpointValue();
+
+    setControlValue('primarySlider', 'primaryDisplay', 0);
+    setControlValue('secondarySlider', 'secondaryDisplay', 0);
+    setControlValue('onoffSecondarySlider', 'onoffSecondaryDisplay', 0);
+    setControlValue('pidSecondarySlider', 'pidSecondaryDisplay', 0);
+    setControlValue('onoffSetpointSlider', 'onoffSetpointDisplay', safeSetpoint);
+    setControlValue('pidSetpointSlider', 'pidSetpointDisplay', safeSetpoint);
+    closeValveButtons();
+
+    lastSetpoint = safeSetpoint;
+    showSetpoint(safeSetpoint);
+    lastPidValues = { proportional: 0, integral: 0, derivative: 0, output: 0 };
+
+    if (CFG.valveToggle) queueSend({ H: 0 }, 'Valve closed');
+    if (CFG.secondaryOutput) {
+      queueSend({ F: 1 }, CFG.secondaryOutput.label + ' force update');
+      queueSend({ F: 0 }, CFG.secondaryOutput.label);
+    }
+    queueSend({ P: 1 }, CFG.primaryOutput.label + ' force update');
+    queueSend({ P: 0 }, CFG.primaryOutput.label);
+    queueSend({ T: pulseSetpointValue(safeSetpoint) }, 'Setpoint force update');
+    queueSend({ T: safeSetpoint }, 'Setpoint');
   }
 
   function updatePIDInputsVisibility() {
@@ -214,6 +357,10 @@
 
   // ── Chart destroy helper ──────────────────────────────────────────────────────
   function destroyCharts() {
+    if (chartRenderTimer) {
+      clearTimeout(chartRenderTimer);
+      chartRenderTimer = null;
+    }
     function killChart(ref) {
       if (!ref) return;
       try {
@@ -263,12 +410,49 @@
     }
   }
 
+  function renderChartsNow() {
+    if (chartJsRef) chartJsRef.update('none');
+    if (liveChartRef) liveChartRef.update('none');
+  }
+
+  function scheduleChartRender() {
+    var now = Date.now();
+    var wait = Math.max(0, CHART_RENDER_INTERVAL_MS - (now - lastChartRenderMs));
+    if (wait === 0) {
+      if (chartRenderTimer) {
+        clearTimeout(chartRenderTimer);
+        chartRenderTimer = null;
+      }
+      lastChartRenderMs = now;
+      renderChartsNow();
+      return;
+    }
+    if (!chartRenderTimer) {
+      chartRenderTimer = setTimeout(function () {
+        chartRenderTimer = null;
+        lastChartRenderMs = Date.now();
+        renderChartsNow();
+      }, wait);
+    }
+  }
+
   // ── Time label ────────────────────────────────────────────────────────────────
   function timeLabel() {
     var now = new Date();
     return now.getHours().toString().padStart(2,'0') + ':' +
            now.getMinutes().toString().padStart(2,'0') + ':' +
            now.getSeconds().toString().padStart(2,'0');
+  }
+
+  function localTimestamp() {
+    var now = new Date();
+    return now.getFullYear() + '-' +
+      (now.getMonth() + 1).toString().padStart(2, '0') + '-' +
+      now.getDate().toString().padStart(2, '0') + 'T' +
+      now.getHours().toString().padStart(2, '0') + ':' +
+      now.getMinutes().toString().padStart(2, '0') + ':' +
+      now.getSeconds().toString().padStart(2, '0') + '.' +
+      now.getMilliseconds().toString().padStart(3, '0');
   }
 
   // ── Init charts ───────────────────────────────────────────────────────────────
@@ -507,18 +691,53 @@
 
     autoScaleY(chartJsRef);
     autoScaleY(liveChartRef);
-    chartJsRef.update('none');
-    liveChartRef.update('none');
+    scheduleChartRender();
 
     // CSV
     if (isSavingCsv) {
-      csvRows.push([
-        new Date().toISOString(),
-        tl,
+      var csvRow = [
+        localTimestamp(),
         (typeof sensorVal === 'number' ? sensorVal.toFixed(2) : ''),
-        (typeof outputVal  === 'number' ? outputVal.toFixed(2)  : ''),
-        (lastSetpoint !== null ? lastSetpoint : '')
-      ].join(','));
+        (typeof outputVal  === 'number' ? outputVal.toFixed(2)  : '')
+      ];
+      if (csvSessionMode !== 'manual') {
+        csvRow.push(lastSetpoint !== null ? lastSetpoint : '');
+      }
+      if (csvSessionMode === 'onoff') {
+        csvRow.push(typeof lastHysteresis === 'number' ? lastHysteresis : '');
+      }
+      if (csvSessionMode === 'pid') {
+        var pidPSetVal = parseFloat((el('pidPInput') || {}).value);
+        var pidISetVal = parseFloat((el('pidIInput') || {}).value);
+        var pidDSetVal = parseFloat((el('pidDInput') || {}).value);
+        csvRow.push(
+          currentPidControlType,
+          lastPidValues.output.toFixed(2),
+          lastPidValues.proportional.toFixed(2),
+          lastPidValues.integral.toFixed(2),
+          lastPidValues.derivative.toFixed(2),
+          lastPidFrequency,
+          isNaN(pidPSetVal) ? '' : pidPSetVal.toFixed(2),
+          isNaN(pidISetVal) ? '' : pidISetVal.toFixed(2),
+          isNaN(pidDSetVal) ? '' : pidDSetVal.toFixed(2)
+        );
+      }
+      if (CFG.secondaryOutput) {
+        csvRow.push(typeof valveVal === 'number' ? valveVal.toFixed(2) : '');
+      }
+      var csvLine = csvRow.join(',');
+      if (csvSavePath && api && api.appendFile) {
+        // Flush straight to disk so data already captured survives a sudden app close.
+        api.appendFile(csvSavePath, csvLine + '\n').then(function (result) {
+          if (!result || !result.success) {
+            addLog('Error appending CSV row: ' + ((result && result.error) || 'Unknown error'), 'error');
+          }
+        }).catch(function (err) {
+          addLog('Error appending CSV row: ' + (err && err.message || err), 'error');
+        });
+      } else {
+        csvRows.push(csvLine);
+      }
     }
   }
 
@@ -567,10 +786,17 @@
 
   // ── Mode switching ────────────────────────────────────────────────────────────
   function switchMode(mode) {
+    resetControlsForModeSwitch();
+
     currentMode = mode;
     skipNextPoint = true;
 
     var modeCode = mode === 'manual' ? 1 : mode === 'onoff' ? 2 : 3;
+    if (mode === 'pid') {
+      loadProductPidValues();
+      lastPidValues = { proportional: 0, integral: 0, derivative: 0, output: 0 };
+      queueSend({ W: 2 }, 'PID Integral Reset');
+    }
     queueSend({ C: modeCode }, 'Control Mode');
 
     // Update button styles
@@ -658,6 +884,7 @@
     }
     slider.addEventListener('input', updateDisplay);   // update UI only while dragging
     slider.addEventListener('change', send);           // send to hardware on release
+    updateDisplay();                                   // seed display/setpoint from default value
     if (display) {
       display.addEventListener('change', function () {
         var v = Math.min(Math.max(parseFloat(display.value), parseFloat(slider.min)), parseFloat(slider.max));
@@ -710,7 +937,7 @@
       var al = document.querySelector('.sidebar-link[data-admin-tab="' + adminTab + '"]');
       if (al) al.classList.add('active');
     } else {
-      var pl = document.querySelector('.sidebar-link[data-page="' + pageId.replace('page-','') + '"]:not([data-admin-tab])');
+      var pl = document.querySelector('.sidebar-link[data-page="' + pageId.replace('page-','') + '"]:not([data-admin-tab]):not([data-app])');
       if (pl) pl.classList.add('active');
     }
   }
@@ -718,23 +945,21 @@
   function switchToApp(appKey) {
     if (appKey === 'curriculum') {
       window._skipDisconnectOnUnload = true;
-      window.location.href = 'index.html#curriculum';
+      var originType = (window.HARDWARE_CONFIG && window.HARDWARE_CONFIG.type) || '';
+      window.location.href = 'index.html?from=' + encodeURIComponent(originType) + '#curriculum';
       return;
     }
-    // Toggle top tab buttons
-    document.querySelectorAll('#app-tab-bar .tab').forEach(function (t) {
-      t.classList.toggle('tab-active', t.dataset.app === appKey);
-    });
     // Show/hide sidebar menus
     Object.keys(APP_MENUS).forEach(function (app) {
       var menu = el(APP_MENUS[app]);
       if (menu) menu.classList.toggle('hidden', app !== appKey);
     });
-    // Hide top tab bar when in admin
-    var topBar = el('top-tab-bar-container');
-    if (topBar) topBar.classList.toggle('hidden', appKey === 'admin');
     // Navigate to default page
     showPage(APP_DEFAULT_PAGES[appKey] || 'page-pct-main');
+    // Highlight active app-switcher entry
+    document.querySelectorAll('#sidebar-apps .sidebar-link').forEach(function (t) {
+      t.classList.toggle('active', t.dataset.app === appKey);
+    });
   }
 
   // ── Hardware navigation ───────────────────────────────────────────────────────
@@ -784,13 +1009,67 @@
   }
 
   // ── CSV ───────────────────────────────────────────────────────────────────────
+  function filenameTimestamp() {
+    var now = new Date();
+    return now.getFullYear() + '-' +
+      (now.getMonth() + 1).toString().padStart(2, '0') + '-' +
+      now.getDate().toString().padStart(2, '0') + ' ' +
+      now.getHours().toString().padStart(2, '0') + '-' +
+      now.getMinutes().toString().padStart(2, '0') + '-' +
+      now.getSeconds().toString().padStart(2, '0');
+  }
+
+  function typeDisplayName() {
+    return CFG.type.split('-').map(function (w) {
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    }).join(' ');
+  }
+
   function startCsv() {
-    csvRows = ['Timestamp,Time,' + CFG.sensor.label + '(' + CFG.sensor.unit + '),Output,Setpoint'];
-    isSavingCsv = true;
-    var s = el('startCsvBtn'), t = el('stopCsvBtn');
-    if (s) s.style.display = 'none';
-    if (t) t.style.display = '';
-    addLog('CSV capture started', 'success');
+    csvSessionMode = currentMode;
+    var header = 'Timestamp,' + CFG.sensor.label + '(' + CFG.sensor.unit + '),Output' +
+      (csvSessionMode !== 'manual' ? ',Setpoint' : '') +
+      (csvSessionMode === 'onoff' ? ',Hysteresis(' + CFG.sensor.unit + ')' : '') +
+      (csvSessionMode === 'pid' ? ',PIDControlType,PIDOutput,Proportional,Integral,Derivative,PID_Frequency,PID_P_Set,PID_I_Set,PID_D_Set' : '') +
+      (CFG.secondaryOutput ? ',' + CFG.secondaryOutput.label + '(' + CFG.secondaryOutput.unit + ')' : '');
+    var filename = 'Process Control ' + typeDisplayName() + ' ' + filenameTimestamp() + '.csv';
+
+    if (isElectron && api.showSaveDialog) {
+      // Ask for the save location up front so the file exists on disk before
+      // any data arrives — rows are then appended live, not buffered until Stop.
+      api.showSaveDialog({ defaultPath: filename, filters: [{ name: 'CSV', extensions: ['csv'] }] })
+        .then(function (result) {
+          if (!result || result.canceled || !result.filePath) {
+            addLog('CSV save cancelled', 'warn');
+            return;
+          }
+          return api.writeFile(result.filePath, header + '\n').then(function (writeResult) {
+            if (writeResult && writeResult.success) {
+              csvSavePath = result.filePath;
+              csvRows = [];
+              isSavingCsv = true;
+              var s = el('startCsvBtn'), t = el('stopCsvBtn');
+              if (s) s.style.display = 'none';
+              if (t) t.style.display = '';
+              addLog('CSV file created and capture started: ' + result.filePath, 'success');
+            } else {
+              addLog('Could not create CSV file: ' + ((writeResult && writeResult.error) || 'Unknown error'), 'error');
+            }
+          });
+        })
+        .catch(function (err) {
+          addLog('Error opening save dialog: ' + (err && err.message || err), 'error');
+        });
+    } else {
+      // Web fallback — no save dialog available; buffer in memory and download on Stop.
+      csvSavePath = null;
+      csvRows = [header];
+      isSavingCsv = true;
+      var s = el('startCsvBtn'), t = el('stopCsvBtn');
+      if (s) s.style.display = 'none';
+      if (t) t.style.display = '';
+      addLog('CSV capture started - will download when stopped', 'success');
+    }
   }
 
   function stopCsv() {
@@ -798,20 +1077,23 @@
     var s = el('startCsvBtn'), t = el('stopCsvBtn');
     if (s) s.style.display = '';
     if (t) t.style.display = 'none';
-    var content = csvRows.join('\n');
-    var filename = CFG.type + '-data.csv';
-    if (isElectron && api.showSaveDialog) {
-      api.showSaveDialog({ defaultPath: filename, filters: [{ name: 'CSV', extensions: ['csv'] }] })
-        .then(function (p) { if (p) return api.writeFile(p, content); })
-        .catch(function () {});
-    } else {
-      var a = document.createElement('a');
-      a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(content);
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+
+    if (csvSavePath) {
+      // Rows were already appended to disk as they arrived.
+      addLog('CSV saved to: ' + csvSavePath, 'success');
+      csvSavePath = null;
+      csvRows = [];
+      return;
     }
+
+    var content = csvRows.join('\n');
+    var filename = 'Process Control ' + typeDisplayName() + ' ' + filenameTimestamp() + '.csv';
+    var a = document.createElement('a');
+    a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(content);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     addLog('CSV saved', 'success');
   }
 
@@ -820,9 +1102,12 @@
     var p = parseFloat((el('pidPInput') || {}).value) || 0;
     var i = parseFloat((el('pidIInput') || {}).value) || 0;
     var d = parseFloat((el('pidDInput') || {}).value) || 0;
+    saveProductPidValue('P', p);
+    saveProductPidValue('I', i);
+    saveProductPidValue('D', d);
     queueSend({ PID_P: p }, 'PID P');
-    setTimeout(function () { queueSend({ PID_I: i }, 'PID I'); }, 50);
-    setTimeout(function () { queueSend({ PID_D: d }, 'PID D'); }, 100);
+    queueSend({ PID_I: i }, 'PID I');
+    queueSend({ PID_D: d }, 'PID D');
     addLog('PID committed: P=' + p + ' I=' + i + ' D=' + d, 'success');
   }
 
@@ -946,6 +1231,17 @@
           <div class="card-body gap-4">
             <h2 class="card-title text-base border-b border-success pb-3">🎛️ PID Control Settings</h2>
             <div class="space-y-1">
+              <label class="label pb-0" for="adminPidProduct"><span class="label-text font-semibold">Product:</span></label>
+              <select id="adminPidProduct" class="select select-bordered select-sm w-full">
+                <option value="temperature">201 — Temperature</option>
+                <option value="pressure">202 — Pressure</option>
+                <option value="level">203 — Level</option>
+                <option value="flow">204 — Flow</option>
+                <option value="servo-speed">205 — Servo Speed</option>
+                <option value="servo-angle">206 — Servo Angle</option>
+              </select>
+            </div>
+            <div class="space-y-1">
               <label class="label pb-0" for="proportionalInput"><span class="label-text font-semibold">Proportional (P):</span></label>
               <div class="flex items-center gap-3">
                 <input type="text" id="proportionalInput" placeholder="Enter float value (e.g., 1.5)" class="input input-bordered input-sm flex-1">
@@ -966,7 +1262,11 @@
                 <span class="pid-status" id="differentialStatus"></span>
               </div>
             </div>
-            <p class="text-xs text-base-content/50 mt-1">These values are used as starting defaults when switching PID control types. Changes are saved automatically.</p>
+            <div class="space-y-1">
+              <label class="label pb-0" for="adminPidFrequency"><span class="label-text font-semibold">Frequency (Hz):</span></label>
+              <input type="number" id="adminPidFrequency" min="0.2" max="1000" step="0.01" class="input input-bordered input-sm w-full">
+            </div>
+            <p class="text-xs text-base-content/50 mt-1">Values are saved as defaults for the selected product and sent when that product enters PID mode.</p>
             <div class="card-actions justify-end mt-2">
               <button id="pidRestoreDefaultsBtn" class="btn btn-sm btn-outline btn-warning">Restore to Default</button>
               <span id="pidRestoreStatus" class="text-xs self-center"></span>
@@ -1124,14 +1424,34 @@
   }
 
   function loadAdminPIDDefaults() {
-    var pStored = localStorage.getItem('admin-pid-P'), iStored = localStorage.getItem('admin-pid-I'), dStored = localStorage.getItem('admin-pid-D');
-    var p = pStored !== null ? parseFloat(pStored) : PID_FACTORY_DEFAULTS.P;
-    var i = iStored !== null ? parseFloat(iStored) : PID_FACTORY_DEFAULTS.I;
-    var d = dStored !== null ? parseFloat(dStored) : PID_FACTORY_DEFAULTS.D;
-    var pIn = el('proportionalInput'), iIn = el('integralInput'), dIn = el('differentialInput');
+    var productSelect = el('adminPidProduct');
+    var type = productSelect ? productSelect.value : CFG.type;
+    var configured = {
+      temperature: { P: 3.162, I: 0.01, D: 150, frequency: 1 },
+      pressure: { P: 5, I: 0.5, D: 0, frequency: 5 },
+      level: { P: 3.162, I: 0.01, D: 150, frequency: 5 },
+      flow: { P: 3.162, I: 0.01, D: 150, frequency: 1 },
+      'servo-speed': { P: 1.5, I: 250, D: 0.02, frequency: 250 },
+      'servo-angle': { P: 0.7, I: 2, D: 0.09, frequency: 250 }
+    }[type] || PID_FACTORY_DEFAULTS;
+    function stored(term, fallback) {
+      var value = parseFloat(localStorage.getItem('pid-' + type + '-' + term));
+      return isNaN(value) ? fallback : value;
+    }
+    var p = stored('P', configured.P), i = stored('I', configured.I), d = stored('D', configured.D);
+    var frequency = stored('frequency', configured.frequency);
+    var pIn = el('proportionalInput'), iIn = el('integralInput'), dIn = el('differentialInput'), fIn = el('adminPidFrequency');
     if (pIn) { pIn.value = p; lastProportionalValue = String(p); }
     if (iIn) { iIn.value = i; lastIntegralValue = String(i); }
     if (dIn) { dIn.value = d; lastDifferentialValue = String(d); }
+    if (fIn) fIn.value = frequency;
+  }
+
+  function saveAdminPIDValue(type, term, value) {
+    localStorage.setItem('pid-' + type + '-' + term, String(value));
+    if (type === 'temperature' && term !== 'frequency') {
+      localStorage.setItem('pid-default-' + term, String(value));
+    }
   }
 
   function updatePIDStatus(type, success, message) {
@@ -1464,11 +1784,6 @@
     // Sidebar
     initSidebar();
 
-    // Top tab bar tabs
-    document.querySelectorAll('#app-tab-bar .tab').forEach(function (tab) {
-      tab.addEventListener('click', function () { switchToApp(tab.dataset.app); });
-    });
-
     // Sidebar link clicks (delegated)
     document.addEventListener('click', function (e) {
       var link = e.target.closest('.sidebar-link');
@@ -1478,7 +1793,7 @@
       var adminTab = link.dataset.adminTab;
       var appKey   = link.dataset.app;
       if (!pageId) return;
-      if (appKey && APP_MENUS[appKey]) switchToApp(appKey);
+      if (appKey) switchToApp(appKey);
       showPage('page-' + pageId, adminTab);
       // Close sidebar on mobile
       if (window.innerWidth < 768) {
@@ -1511,14 +1826,21 @@
     // PID frequency selector
     var pidFreqSelect = el('pidFrequency');
     if (pidFreqSelect) {
+      var initFreqVal = parseFloat(pidFreqSelect.value);
+      if (!isNaN(initFreqVal) && initFreqVal > 0) lastPidFrequency = initFreqVal;
       pidFreqSelect.addEventListener('change', function () {
         var val = parseFloat(pidFreqSelect.value);
-        if (!isNaN(val) && val > 0) queueSend({ PID_Hz: val }, 'PID Frequency');
+        if (!isNaN(val) && val > 0) {
+          lastPidFrequency = val;
+          saveProductPidValue('frequency', val);
+          queueSend({ PID_Hz: val }, 'PID Frequency');
+        }
       });
     }
 
     // ── Manual mode controls ─────────────────────────────────────────────────
     bindSlider('primarySlider', 'primaryDisplay', 'P', CFG.primaryOutput.label);
+    loadProductPidValues();
     bindValveToggle('valveToggleBtn');
     if (CFG.secondaryOutput) bindSlider('secondarySlider', 'secondaryDisplay', 'F', CFG.secondaryOutput.label);
 
@@ -1542,23 +1864,21 @@
     var pidCommitBtn = el('pidCommitBtn');
     if (pidCommitBtn) pidCommitBtn.addEventListener('click', commitPID);
     var pidResetBtn = el('pidResetBtn');
-    if (pidResetBtn) pidResetBtn.addEventListener('click', function () {
-      ['pidPInput','pidIInput','pidDInput'].forEach(function (id) { var inp = el(id); if (inp) inp.value = ''; });
-    });
+    if (pidResetBtn) pidResetBtn.addEventListener('click', resetProductPidValues);
     var pidPInputEl = el('pidPInput');
     if (pidPInputEl) pidPInputEl.addEventListener('change', function () {
       var val = parseFloat(pidPInputEl.value);
-      if (!isNaN(val)) queueSend({ PID_P: val }, 'PID P');
+      if (!isNaN(val)) { saveProductPidValue('P', val); queueSend({ PID_P: val }, 'PID P'); }
     });
     var pidIInputEl = el('pidIInput');
     if (pidIInputEl) pidIInputEl.addEventListener('change', function () {
       var val = parseFloat(pidIInputEl.value);
-      if (!isNaN(val)) queueSend({ PID_I: val }, 'PID I');
+      if (!isNaN(val)) { saveProductPidValue('I', val); queueSend({ PID_I: val }, 'PID I'); }
     });
     var pidDInputEl = el('pidDInput');
     if (pidDInputEl) pidDInputEl.addEventListener('change', function () {
       var val = parseFloat(pidDInputEl.value);
-      if (!isNaN(val)) queueSend({ PID_D: val }, 'PID D');
+      if (!isNaN(val)) { saveProductPidValue('D', val); queueSend({ PID_D: val }, 'PID D'); }
     });
 
     // ── Chart toolbar ────────────────────────────────────────────────────────
@@ -1627,13 +1947,24 @@
     setBootloaderButtonState('disconnected');
     loadAdminPIDDefaults();
 
+    var adminPidProduct = el('adminPidProduct');
+    if (adminPidProduct) {
+      adminPidProduct.value = CFG.type;
+      loadAdminPIDDefaults();
+      adminPidProduct.addEventListener('change', function () {
+        loadAdminPIDDefaults();
+        var selected = adminPidProduct.options[adminPidProduct.selectedIndex];
+        addLog('Loaded PID defaults for ' + (selected ? selected.textContent : adminPidProduct.value), 'info');
+      });
+    }
+
     var proportionalInput = el('proportionalInput');
     if (proportionalInput) {
       proportionalInput.addEventListener('change', function () {
         var v = this.value.trim();
         if (v !== lastProportionalValue && v !== '') {
-          lastProportionalValue = v; localStorage.setItem('admin-pid-P', v);
-          if (isElectron && api.sendCustomJson) api.sendCustomJson({ Q: parseFloat(v) }, 'Admin P').catch(function () {});
+          lastProportionalValue = v;
+          saveAdminPIDValue(adminPidProduct ? adminPidProduct.value : CFG.type, 'P', v);
           updatePIDStatus('proportional', true, 'Saved');
         }
       });
@@ -1643,8 +1974,8 @@
       integralInput.addEventListener('change', function () {
         var v = this.value.trim();
         if (v !== lastIntegralValue && v !== '') {
-          lastIntegralValue = v; localStorage.setItem('admin-pid-I', v);
-          if (isElectron && api.sendCustomJson) api.sendCustomJson({ R: parseFloat(v) }, 'Admin I').catch(function () {});
+          lastIntegralValue = v;
+          saveAdminPIDValue(adminPidProduct ? adminPidProduct.value : CFG.type, 'I', v);
           updatePIDStatus('integral', true, 'Saved');
         }
       });
@@ -1654,24 +1985,41 @@
       differentialInput.addEventListener('change', function () {
         var v = this.value.trim();
         if (v !== lastDifferentialValue && v !== '') {
-          lastDifferentialValue = v; localStorage.setItem('admin-pid-D', v);
-          if (isElectron && api.sendCustomJson) api.sendCustomJson({ S: parseFloat(v) }, 'Admin D').catch(function () {});
+          lastDifferentialValue = v;
+          saveAdminPIDValue(adminPidProduct ? adminPidProduct.value : CFG.type, 'D', v);
           updatePIDStatus('differential', true, 'Saved');
+        }
+      });
+    }
+    var adminPidFrequency = el('adminPidFrequency');
+    if (adminPidFrequency) {
+      adminPidFrequency.addEventListener('change', function () {
+        var v = parseFloat(this.value);
+        if (!isNaN(v) && v > 0) {
+          saveAdminPIDValue(adminPidProduct ? adminPidProduct.value : CFG.type, 'frequency', v);
+          updatePIDStatus('proportional', true, 'Saved');
         }
       });
     }
     var pidRestoreBtn = el('pidRestoreDefaultsBtn');
     if (pidRestoreBtn) {
       pidRestoreBtn.addEventListener('click', function () {
-        var p = PID_FACTORY_DEFAULTS.P, i = PID_FACTORY_DEFAULTS.I, d = PID_FACTORY_DEFAULTS.D;
-        localStorage.setItem('admin-pid-P', p); localStorage.setItem('admin-pid-I', i); localStorage.setItem('admin-pid-D', d);
-        var pIn = el('proportionalInput'), iIn = el('integralInput'), dIn = el('differentialInput');
-        if (pIn) { pIn.value = p; lastProportionalValue = String(p); }
-        if (iIn) { iIn.value = i; lastIntegralValue = String(i); }
-        if (dIn) { dIn.value = d; lastDifferentialValue = String(d); }
+        var type = adminPidProduct ? adminPidProduct.value : CFG.type;
+        ['P', 'I', 'D', 'frequency'].forEach(function (term) {
+          localStorage.removeItem('pid-' + type + '-' + term);
+        });
+        loadAdminPIDDefaults();
+        var p = parseFloat((el('proportionalInput') || {}).value) || 0;
+        var i = parseFloat((el('integralInput') || {}).value) || 0;
+        var d = parseFloat((el('differentialInput') || {}).value) || 0;
+        var frequency = parseFloat((el('adminPidFrequency') || {}).value) || 0;
+        saveAdminPIDValue(type, 'P', p);
+        saveAdminPIDValue(type, 'I', i);
+        saveAdminPIDValue(type, 'D', d);
+        saveAdminPIDValue(type, 'frequency', frequency);
         var rs = el('pidRestoreStatus');
-        if (rs) { rs.textContent = 'Restored to P=' + p + ', I=' + i + ', D=' + d; setTimeout(function () { rs.textContent = ''; }, 4000); }
-        addLog('PID defaults restored: P=' + p + ', I=' + i + ', D=' + d, 'info');
+        if (rs) { rs.textContent = 'Restored P=' + p + ', I=' + i + ', D=' + d + ', F=' + frequency + ' Hz'; setTimeout(function () { rs.textContent = ''; }, 4000); }
+        addLog('PID defaults restored for ' + type + ': P=' + p + ', I=' + i + ', D=' + d + ', F=' + frequency + ' Hz', 'info');
       });
     }
 

@@ -247,7 +247,7 @@ function getCsvHeaderLineForMode(modeName) {
         return 'TargetTempC,HeaterTempC,HysteresisC,PowerInput,FanPercent\n';
     }
     if (modeName === 'pid') {
-        return 'PIDControlType,TargetTempC,HeaterTempC,Output,Proportional,Integral,Derivative,FanPercent,PID_P_Set,PID_I_Set,PID_D_Set\n';
+        return 'PIDControlType,TargetTempC,HeaterTempC,Output,Proportional,Integral,Derivative,FanPercent,PID_P_Set,PID_I_Set,PID_D_Set,PID_Frequency\n';
     }
     return 'Value\n';
 }
@@ -256,7 +256,19 @@ function addCsvRowForCurrentSession(rowData) {
     if (!isSavingCsv || !csvSessionMode) {
         return;
     }
-    csvData.push(rowData);
+    if (csvSavePath && window.electronAPI && window.electronAPI.appendFile) {
+        // Flush straight to disk so data already captured survives a sudden app close,
+        // instead of only living in memory until Stop is pressed.
+        window.electronAPI.appendFile(csvSavePath, rowData + '\n').then(function (result) {
+            if (!result || !result.success) {
+                addToLog('Error appending CSV row: ' + ((result && result.error) || 'Unknown error'));
+            }
+        }).catch(function (error) {
+            addToLog('Error appending CSV row: ' + (error && error.message || error));
+        });
+    } else {
+        csvData.push(rowData);
+    }
 }
 
 
@@ -1687,6 +1699,14 @@ async function sendShutdownCommandsOnReconnect() {
             addToLog('Control mode set to Manual (1)');
         }
 
+        // Firmware only writes the PWM/output register when the incoming value
+        // differs from its last-cached value — since that cache already reads 0
+        // on boot, sending 0 as the very first command is a no-op and the
+        // fan/heater keeps running at whatever duty it powered up with. Pulse a
+        // tiny nonzero value first to force a real register write, then drop to 0.
+        await window.electronAPI.sendFanSpeed(1);
+        await window.electronAPI.sendPower(1);
+
         // 2. Send fan stop command (0%)
         var fanResult = await window.electronAPI.sendFanSpeed(0);
         if (fanResult && fanResult.success) {
@@ -2363,12 +2383,23 @@ function clearLog() {
 
 
 
+function csvFilenameTimestamp() {
+    var now = new Date();
+    var year = now.getFullYear();
+    var month = String(now.getMonth() + 1).padStart(2, '0');
+    var day = String(now.getDate()).padStart(2, '0');
+    var hours = String(now.getHours()).padStart(2, '0');
+    var minutes = String(now.getMinutes()).padStart(2, '0');
+    var seconds = String(now.getSeconds()).padStart(2, '0');
+    return year + '-' + month + '-' + day + ' ' + hours + '-' + minutes + '-' + seconds;
+}
+
 function startCsvSaving() {
     // Ask user for save location
     if (window.electronAPI && window.electronAPI.showSaveDialog) {
         window.electronAPI.showSaveDialog({
             title: 'Save Process Control Temperature Data',
-            defaultPath: 'Process Control Temperature Data.csv',
+            defaultPath: 'Process Control Temperature ' + csvFilenameTimestamp() + '.csv',
             filters: [
                 { name: 'CSV Files', extensions: ['csv'] },
                 { name: 'All Files', extensions: ['*'] }
@@ -2422,6 +2453,15 @@ function stopCsvSaving() {
     startCsvBtn.style.display = 'inline-block'; // Show start button
     stopCsvBtn.style.display = 'none'; // Hide stop button
 
+    if (csvSavePath) {
+        // Rows were already appended to disk as they arrived - nothing left to write.
+        addToLog('CSV file saved to: ' + csvSavePath);
+        csvSavePath = null;
+        csvSessionMode = null;
+        csvSessionPidControlType = null;
+        return;
+    }
+
     if (csvData.length === 0) {
         addToLog('No data collected during saving session');
         csvSessionMode = null;
@@ -2429,55 +2469,18 @@ function stopCsvSaving() {
         return;
     }
 
-    // Create CSV content from collected rows
+    // Web fallback (no Electron API): create CSV content from collected rows and download.
     var csvContent = getCsvHeaderLineForMode(csvSessionMode);
     for (var i = 0; i < csvData.length; i++) {
         csvContent += csvData[i] + '\n';
     }
-
-    // Save to the selected path if available
-    if (csvSavePath && window.electronAPI && window.electronAPI.writeFile) {
-        // Save to the selected file path
-        window.electronAPI.writeFile(csvSavePath, csvContent).then(function (result) {
-            if (result && result.success) {
-                addToLog('CSV file saved to: ' + csvSavePath + ' (' + csvData.length + ' points collected)');
-                csvSavePath = null; // Reset the path
-                csvSessionMode = null;
-                csvSessionPidControlType = null;
-            } else {
-                var errorMessage = (result && result.error) ? result.error : 'Unknown error while writing CSV file';
-                addToLog('Error saving CSV file: ' + errorMessage);
-                // Fallback to download
-                downloadCsvFile(csvContent);
-                csvSessionMode = null;
-                csvSessionPidControlType = null;
-            }
-        }).catch(function (error) {
-            addToLog('Error saving CSV file: ' + error.message);
-            // Fallback to download
-            downloadCsvFile(csvContent);
-            csvSessionMode = null;
-            csvSessionPidControlType = null;
-        });
-    } else {
-        // Fallback to download
-        downloadCsvFile(csvContent);
-        csvSessionMode = null;
-        csvSessionPidControlType = null;
-    }
+    downloadCsvFile(csvContent);
+    csvSessionMode = null;
+    csvSessionPidControlType = null;
 }
 
 function downloadCsvFile(csvContent) {
-    // Generate filename with current date and time
-    var now = new Date();
-    var year = now.getFullYear();
-    var month = String(now.getMonth() + 1).padStart(2, '0');
-    var day = String(now.getDate()).padStart(2, '0');
-    var hours = String(now.getHours()).padStart(2, '0');
-    var minutes = String(now.getMinutes()).padStart(2, '0');
-    var seconds = String(now.getSeconds()).padStart(2, '0');
-
-    var filename = 'Process Control Temperature ' + year + '-' + month + '-' + day + ' ' + hours + '-' + minutes + '-' + seconds + '.csv';
+    var filename = 'Process Control Temperature ' + csvFilenameTimestamp() + '.csv';
 
     // Create and download the file
     var blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -3011,6 +3014,10 @@ function handleJsonData(jsonData) {
                 if (isNaN(pidISet)) pidISet = 0;
                 if (isNaN(pidDSet)) pidDSet = 0;
 
+                var pidFrequencyElement = document.getElementById('pidFrequency');
+                var pidFreqForCsv = pidFrequencyElement ? parseFloat(pidFrequencyElement.value) : 1;
+                if (isNaN(pidFreqForCsv)) pidFreqForCsv = 1;
+
                 addCsvRowForCurrentSession(
                     (csvSessionPidControlType || getPidControlTypeFromUI()) + ',' +
                     pidTargetForCsv.toFixed(1) + ',' +
@@ -3022,7 +3029,8 @@ function handleJsonData(jsonData) {
                     fanForCsv + ',' +
                     pidPSet.toFixed(2) + ',' +
                     pidISet.toFixed(2) + ',' +
-                    pidDSet.toFixed(2)
+                    pidDSet.toFixed(2) + ',' +
+                    pidFreqForCsv
                 );
             }
         }
@@ -4770,6 +4778,28 @@ document.addEventListener('DOMContentLoaded', function () {
                     event.preventDefault();
                     pidFrequency.blur();
                 }
+            });
+        }
+
+        var pidResetBtn = document.getElementById('pidResetBtn');
+        if (pidResetBtn) {
+            pidResetBtn.addEventListener('click', async function () {
+                var pValue = 3.162, iValue = 0.01, dValue = 150, frequencyValue = 1.0;
+                if (pidPInput) pidPInput.value = pValue;
+                if (pidIInput) pidIInput.value = iValue;
+                if (pidDInput) pidDInput.value = dValue;
+                if (pidFrequency) pidFrequency.value = String(frequencyValue);
+                localStorage.setItem('pid-default-P', String(pValue));
+                localStorage.setItem('pid-default-I', String(iValue));
+                localStorage.setItem('pid-default-D', String(dValue));
+
+                if (window.electronAPI && window.electronAPI.sendPIDValue) {
+                    await window.electronAPI.sendPIDValue('P', pValue);
+                    await window.electronAPI.sendPIDValue('I', iValue);
+                    await window.electronAPI.sendPIDValue('D', dValue);
+                    await window.electronAPI.sendPIDFrequency(frequencyValue);
+                }
+                addToLog('PID defaults restored and sent to hardware');
             });
         }
 

@@ -99,6 +99,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // File operations
   showSaveDialog: (options) => ipcRenderer.invoke('show-save-dialog', options),
   writeFile: (filePath, content) => ipcRenderer.invoke('write-file', filePath, content),
+  appendFile: (filePath, content) => ipcRenderer.invoke('append-file', filePath, content),
   
   // Window operations
   sendUiDebugLog: (payload) => ipcRenderer.send('ui-debug-log', payload),

@@ -22,7 +22,7 @@ No test suite exists. Minimum Node.js version: 16+.
 
 ## Architecture
 
-This is an **Electron desktop app** (v0.1.9, Electron 43) for laboratory temperature process control. It also runs as an **Express web server** (`server.js`) for tablet access — both modes share the same `index.html`/`renderer.js` frontend.
+This is an **Electron desktop app** (v0.1.9, Electron 43) for laboratory process control across six sensor types (temperature, pressure, level, flow, servo speed, servo angle). It also runs as an **Express web server** (`server.js`) for tablet access — both modes share the same HTML/JS frontends.
 
 ### Process Boundary
 
@@ -76,16 +76,39 @@ PID mode has four sub-types (P / PI / PD / PID) that change the secondary canvas
 
 ### Key Files
 
-- [main.js](main.js) — hardware I/O, IPC handlers, safety sequences, bootloader
+- [main.js](main.js) — hardware I/O, IPC handlers, safety sequences, bootloader, `HARDWARE_ID_MAP` for auto-routing
 - [preload.js](preload.js) — IPC bridge definitions
-- [renderer.js](renderer.js) — all UI logic (~6100 lines); control mode state, chart management, CSV export
-- [renderer-hardware.js](renderer-hardware.js) — shared renderer for all non-temperature sensor pages; driven by `window.HARDWARE_CONFIG`
+- [landing.html](landing.html) — app entry point (`mainWindow.loadFile`); hardware status banner + product cards for all six sensor types; auto-navigates once a `{A: 201-206}` hardware ID is confirmed
+- [index.html](index.html) — Temperature sensor page; also hosts the admin panel and curriculum worksheets as sidebar-switched sub-pages (see below) — the largest file in the repo (~338k) and the one most other pages' inline JS patterns are copied from
+- [renderer.js](renderer.js) — all UI logic for `index.html` (~6100 lines); control mode state, chart management, CSV export
+- [renderer-hardware.js](renderer-hardware.js) — shared renderer for the five non-temperature sensor pages; driven by `window.HARDWARE_CONFIG`
 - [layout.js](layout.js) — clock, mode toggle, temperature display sync
 - [server.js](server.js) — Express server for web/tablet deployment
-- [admin.html](admin.html) + inline JS — live logs, raw data stream, bootloader (HEX upload/erase/verify/run), update check
-- [splash.html](splash.html) — app loading/splash screen
 - [assets/css/matrix-ui.css](assets/css/matrix-ui.css) — DaisyUI + Tailwind UI styles
 - [assets/libs/](assets/libs/) — vendored Three.js, Chart.js, GLTFLoader, OrbitControls
+
+> **Note**: `admin.html` and `splash.html` were removed in v0.1.9 — the admin panel is now an inline sidebar page inside `index.html` (see below), and `landing.html` replaced the splash screen.
+
+### Startup / Landing / Hardware Auto-Routing
+
+`main.js` loads [landing.html](landing.html) first, not `index.html`. Flow:
+
+1. Landing page shows a hardware status banner and six product cards (one per sensor type) while the app connects.
+2. On connect, the hardware broadcasts `{A: 201-206}` (see `HARDWARE_ID_MAP` in [main.js](main.js)); `main.js` forwards it to the renderer via the `hardware-id-received` IPC event (`onHardwareIdReceived` in [preload.js](preload.js)).
+3. After a **1.2s confirmation delay**, landing.html auto-navigates to the matching sensor page (`index.html` for 201/temperature, `pressure.html` for 202, etc.).
+4. On reconnect, the previously active control mode is restored rather than reset to Manual.
+
+### Sidebar Apps Inside `index.html`
+
+`index.html` is not just the temperature dashboard — it's a single-page shell with a left sidebar switching between three "apps", toggled via inline JS (`showPage()` / `switchTab()`, ~line 3193 onward):
+
+| App | Sidebar menu id | Default page | Contents |
+|-----|-----------------|---------------|----------|
+| `main` | `sidebar-main` | `pct-main` | The actual temperature control dashboard (charts, control modes) |
+| `admin` | `sidebar-admin` | `admin` | Tabs: Dashboard, PID Controls, Bootloader, Updates, Settings — live logs, HEX upload/erase/verify/run, update check |
+| `curriculum` | `sidebar-curriculum` | `ws-1` | Worksheets `ws-1` … `ws-10` — PID/process-control teaching material with Prev/Next navigation |
+
+`renderer-hardware.js` pages (pressure/level/flow/servo-*) that need the admin panel or curriculum link back to `index.html` with a query param recording their hardware origin (`HW_ORIGIN_PAGES`), so "back" returns to the correct sensor page instead of always landing on Temperature.
 
 ### Multi-Sensor Pages
 
@@ -147,6 +170,7 @@ bootloader-read-crc, bootloader-jump-to-app, bootloader-erase-program-verify
 load-hex-file, upload-hex-file
 show-open-dialog, show-save-dialog, write-file
 open-admin-panel, check-for-updates, get-app-version
+openExternalUrl
 ```
 
 **Main pushes to renderer** (one-way events):
@@ -156,6 +180,7 @@ connection-status, ports-update
 serial-tx-debug, ui-debug-log
 update-status, auto-tune-progress
 bootloader-progress, hex-upload-progress
+hardware-id-received  →  {A: 201-206} hardware type broadcast, drives landing-page auto-routing
 ```
 
 If `window.electronAPI` is unavailable (web mode), renderer falls back to no-op stubs and uses `webCmd()` — a thin wrapper that sends hardware commands via `fetch('POST /api/command')` to the embedded Express server instead of IPC. This makes all control operations work identically in both Electron and browser contexts.

@@ -4,7 +4,7 @@
 
 **Version:** `0.1.9` &nbsp;|&nbsp; **Platform:** Windows (Electron desktop) &nbsp;|&nbsp; **License:** MIT
 
-> **Status: Stable** — Hardware auto-routing + landing page. Supports Temperature, Pressure, Flow, Level, Servo Speed, and Servo Angle sensor pages — all driven by a shared `renderer-hardware.js` control engine.
+> **Status: Stable** — Hardware auto-routing + landing page. Supports Temperature, Pressure, Flow, Level, Servo Speed, and Servo Angle sensor pages. Temperature uses `renderer.js`; the other hardware pages share `renderer-hardware.js`.
 
 ---
 
@@ -71,13 +71,13 @@ The app opens a landing page on startup and auto-navigates to the correct sensor
 | 205 | [servo-speed.html](servo-speed.html) | Servo Speed | RPM (0–60) |
 | 206 | [servo-angle.html](servo-angle.html) | Servo Angle | ° (−180–180) |
 
-All six pages share the same three control modes and the same `renderer-hardware.js` engine. Only axis ranges, unit labels, and sensor-specific UI details differ.
+The five non-temperature pages share the same `renderer-hardware.js` engine. Only axis ranges, unit labels, output labels, and sensor-specific controls differ. The temperature page uses `renderer.js`.
 
 ---
 
 ## Control Modes
 
-All sensor pages support three control modes. Switching modes sends a safety reset to the hardware and reinitializes the chart.
+All sensor pages support three control modes. Switching modes sends a safety reset to the hardware, resets the visible controls to safe minimum values, and reinitializes the chart.
 
 ---
 
@@ -138,7 +138,7 @@ Closed-loop proportional–integral–derivative control — the hardware comput
 **How it works:**
 - Set a **target setpoint**
 - Configure **P**, **I**, and **D** gains individually
-- Select a **PID sub-type** (`P`, `PI`, `PD`, or full `PID`) — unused terms are zeroed
+- The app uses the full **PID** controller for every product
 - Set a **PID frequency** (update rate sent to hardware)
 - The hardware streams back PID component values (`Pr`, `It`, `Dr`, `Ot`) each cycle, which are overlaid on the secondary chart
 
@@ -149,18 +149,25 @@ Closed-loop proportional–integral–derivative control — the hardware comput
 | Proportional gain (P) | Scales the current error |
 | Integral gain (I) | Accumulates past error (eliminates steady-state offset) |
 | Derivative gain (D) | Predicts future error (reduces overshoot) |
-| Control type | `P` / `PI` / `PD` / `PID` — selects active terms |
+| Control type | Full `PID` controller |
 | PID frequency | Hardware update rate |
 | Fan/secondary | Independent secondary output |
 
-**PID sub-types and secondary canvas datasets:**
+**Product PID presets:**
 
-| Sub-type | Active terms | Secondary canvas datasets |
-|----------|-------------|--------------------------|
-| P | Proportional only | Output |
-| PI | Proportional + Integral | Output, P term, I term |
-| PD | Proportional + Derivative | Output, P term, D term |
-| PID | All three | Output, P term, I term, D term |
+| Product | P | I | D | Frequency |
+|---------|---:|---:|---:|----------:|
+| Pressure | 5 | 0.5 | 0 | 5 Hz |
+| Servo Speed | 1.5 | 250 | 0.02 | 250 Hz |
+| Servo Angle | 0.7 | 2 | 0.09 | 250 Hz |
+
+The selected product's preset is loaded when its page opens and all four values are sent automatically when PID mode is entered. Later edits are remembered separately for each product. `Reset` restores that product's preset and sends the restored P/I/D/frequency values immediately.
+
+**PID term chart datasets:**
+
+| Controller | Active terms | Secondary canvas datasets |
+|------------|-------------|--------------------------|
+| PID | Proportional + Integral + Derivative | Output, P term, I term, D term |
 
 **Hardware data cycle (two messages per cycle):**
 1. Main data: `{T: <pv>, P: <output>, F: <fan>}`
@@ -187,6 +194,22 @@ The renderer stores the PID message in `lastPidValues` and merges it with the ne
 **Default gains:** `P = 3.162`, `I = 0.01`, `D = 150` (factory defaults; user-saved values persist in `localStorage`)
 
 **Typical use:** precise setpoint tracking, laboratory experiments, closed-loop characterization
+
+---
+
+## Shared Hardware Page Safety
+
+`pressure.html`, `level.html`, `flow.html`, `servo-speed.html`, and `servo-angle.html` use `renderer-hardware.js`. On first connection and every control-mode switch, the shared renderer resets the page to a safe idle state before sending the mode command. Brief USB reconnects preserve the current control mode instead of forcing Manual, so a heartbeat hiccup cannot silently switch the operator out of PID. When entering PID, the app sends `W:2` to clear the firmware integral accumulator once and sends the selected product's stored PID preset. The PID `Reset` button restores that preset and sends it immediately. For `P`, `F`, and `T`, the renderer sends a brief nonzero force-update command before the final safe value so firmware cached-value checks cannot leave a physical output running.
+
+| Page | UI reset | Commands sent before mode command |
+|------|----------|-----------------------------------|
+| Pressure | Pump `0`, target `0 PSI`, relief valve `0`, valve button closed | `{H:0}`, `{F:1}`, `{F:0}`, `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
+| Level | Pump `0`, target `0 mm`, valve `0` | `{F:1}`, `{F:0}`, `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
+| Flow | Pump `0`, target `0 L/hr`, valve `0` | `{F:1}`, `{F:0}`, `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
+| Servo Speed | Drive `0`, target `0 RPM` | `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
+| Servo Angle | Drive `0`, target `0°` | `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
+
+For pressure, `H` is a binary relief-valve alias handled by firmware: `0 = closed/off`, `1 = open/full`. Flow and Level use the analog `F` valve output instead.
 
 ---
 
@@ -276,7 +299,7 @@ Commands sent to hardware:
 | `T` | setpoint value | Target setpoint |
 | `Y` | `1–10` | Hysteresis (On/Off mode, device units) |
 | `PID_P / PID_I / PID_D` | numeric | PID gains |
-| `H` | `0 / 1` | Heater off / on (temperature page only) |
+| `H` | `0 / 1` | Binary valve/heater-style off/on command; currently used by Pressure as relief valve closed/open |
 | `A` | hardware ID | Hardware type identifier (sent by device on connect) |
 
 Incoming data arrives as **two separate JSON messages per cycle**:
@@ -290,7 +313,19 @@ Command writes are **throttled to a 40 ms minimum interval** to avoid serial flo
 
 ---
 
-## Admin Panel
+## Sidebar Apps (inside `index.html`)
+
+`index.html` is a single-page shell with a left sidebar that switches between three apps. `admin.html` and `splash.html` were removed in v0.1.9 — the admin panel is now an inline sidebar page rather than a separate window, and `landing.html` replaced the splash screen.
+
+| App | Default page | Contents |
+|-----|---------------|----------|
+| Main | Temperature dashboard | Charts and control modes (see above) |
+| Admin | Dashboard tab | Tabs: Dashboard, PID Controls, Bootloader, Updates, Settings |
+| Curriculum | Worksheet 1 | Worksheets `ws-1` … `ws-10` — PID / process-control teaching material with Prev/Next navigation |
+
+The other sensor pages (`pressure.html`, `flow.html`, `level.html`, `servo-speed.html`, `servo-angle.html`) link back into `index.html` for the Admin Panel and Curriculum, and "back" returns to the correct sensor page rather than always landing on Temperature.
+
+### Admin Panel
 
 | Section | Features |
 |---------|---------|
@@ -304,10 +339,11 @@ Command writes are **throttled to a 40 ms minimum interval** to avoid serial flo
 ## Safety & Reliability
 
 - **On connect:** hardware initialization sequence sent automatically
-- **On close / mode switch:** safe shutdown sequence — sets `C=1, F=0, P=0, T=20, H=0`, PID gains = 0
-- **On reconnect:** charts are cleared and the UI resets to Manual mode; a 1 s debounced delay sends `C:1` to avoid command stacking during unstable reconnects
+- **On close:** safe shutdown sequence — sets `C=1`, `F=0`, `P=0`, `H=0`, PID gains = `0`; setpoint is `T=20` on Temperature and `T=0` on non-temperature pages
+- **On mode switch:** Temperature sends its safe reset sequence; shared hardware pages reset visible controls and send page-specific minimum/off commands before the new mode
+- **On reconnect:** first connection safe-initializes to Manual; later brief reconnects preserve the active control mode and skip one chart point to avoid a visual jump
 - **40 ms minimum command write interval** to avoid serial flooding
-- **Keepalive heartbeat** every 900 ms detects disconnects; consecutive failures trigger automatic reconnect
+- **Keepalive heartbeat** every 100 ms detects disconnects; consecutive failures trigger automatic reconnect
 
 ---
 
@@ -395,8 +431,7 @@ Context isolation is enabled. `preload.js` exposes only a narrow `window.electro
 | [layout.js](layout.js) | Clock, mode toggle, live reading display sync |
 | [server.js](server.js) | Standalone Express server for web/tablet deployment |
 | [landing.html](landing.html) | Startup landing page — hardware status banner + auto-routing on `{A: X}` |
-| [admin.html](admin.html) | Admin panel: logs, raw data, bootloader, updates |
-| [index.html](index.html) | Temperature sensor page |
+| [index.html](index.html) | Temperature sensor page; also hosts the Admin Panel and Curriculum worksheets as sidebar-switched sub-pages |
 | [pressure.html](pressure.html) | Pressure sensor page |
 | [flow.html](flow.html) | Flow sensor page |
 | [level.html](level.html) | Level sensor page |

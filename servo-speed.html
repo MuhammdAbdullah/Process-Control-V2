@@ -67,14 +67,6 @@
     </div>
 </div>
 
-<!-- TOP APP TAB BAR -->
-<div id="top-tab-bar-container" class="bg-base-200 border-b border-base-300 flex-shrink-0 px-2 py-1">
-    <div class="tabs tabs-boxed bg-transparent gap-1" id="app-tab-bar">
-        <button class="tab tab-active font-semibold" data-app="main">⚙️ Main App</button>
-        <button class="tab font-semibold" data-app="curriculum">📚 Curriculum</button>
-    </div>
-</div>
-
 <!-- BODY -->
 <div class="flex flex-1 md:overflow-hidden relative">
     <div id="sidebar-backdrop" class="fixed inset-0 bg-black/50 z-40 hidden"></div>
@@ -84,12 +76,16 @@
         <div class="flex justify-end p-3 md:hidden border-b border-base-300 flex-shrink-0">
             <button id="sidebar-close-btn" class="btn btn-ghost btn-sm btn-square">✕</button>
         </div>
+        <!-- APP SWITCHER (always visible) -->
+        <ul class="menu p-3 gap-1 flex-shrink-0 border-b border-base-300" id="sidebar-apps">
+            <li><a href="#" data-page="pct-main" data-app="main" class="sidebar-link">⚙️ Main App</a></li>
+            <li><a href="#" data-page="ws-1" data-app="curriculum" class="sidebar-link">📚 Curriculum</a></li>
+            <li><a href="#" data-page="admin" data-app="admin" class="sidebar-link">🔧 Admin</a></li>
+        </ul>
         <div class="flex-1 overflow-y-auto">
             <ul class="menu p-3 gap-1" id="sidebar-main">
                 <li class="menu-title">HMI Dashboard</li>
                 <li><a href="#" data-page="pct-main" class="sidebar-link active">⚙️ Servo Speed</a></li>
-                <li class="menu-title mt-2">Tools</li>
-                <li><a href="#" data-page="admin" data-app="admin" class="sidebar-link">🔧 Admin</a></li>
             </ul>
             <ul class="menu p-3 gap-1 hidden" id="sidebar-admin">
                 <li class="menu-title">Admin Panels</li>
@@ -162,9 +158,9 @@
                         <div class="card-body p-4 gap-3">
                             <div class="text-xs font-bold tracking-widest uppercase opacity-50">Target Speed</div>
                             <div class="flex items-center gap-3">
-                                <input type="range" id="onoffSetpointSlider" min="12" max="60" value="12" step="1" class="range range-primary range-sm flex-1">
+                                <input type="range" id="onoffSetpointSlider" min="0" max="60" value="0" step="1" class="range range-primary range-sm flex-1">
                                 <div class="flex items-center gap-1 flex-shrink-0">
-                                    <input type="number" id="onoffSetpointDisplay" min="12" max="60" value="12" step="1"
+                                    <input type="number" id="onoffSetpointDisplay" min="0" max="60" value="0" step="1"
                                            class="input input-bordered input-sm w-16 text-center font-mono tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none">
                                     <span class="text-sm font-bold opacity-60">RPM</span>
                                 </div>
@@ -200,7 +196,7 @@
                     <div class="card bg-base-300 shadow">
                         <div class="card-body p-4 gap-3">
                             <div class="text-xs font-bold tracking-widest uppercase opacity-50">PID Parameters</div>
-                            <div class="flex items-center gap-2">
+                            <div class="hidden flex items-center gap-2">
                                 <span class="text-xs font-semibold opacity-70 w-16 flex-shrink-0">Type:</span>
                                 <select id="pidControlType" class="select select-bordered select-sm flex-1">
                                     <option value="P">P</option>
@@ -234,7 +230,6 @@
                                 </select>
                             </div>
                             <div class="flex gap-2 pt-1">
-                                <button id="pidCommitBtn" class="btn btn-primary btn-sm flex-1">Commit</button>
                                 <button id="pidResetBtn"  class="btn btn-ghost btn-sm flex-1">Reset</button>
                             </div>
                         </div>
@@ -356,6 +351,7 @@ window.HARDWARE_CONFIG = {
     name: 'Servo Speed',
     icon: '⚙️',
     sensor: { label: 'Speed', unit: 'RPM', min: 0, max: 60, decimals: 1 },
+    pidDefaults: { P: 1.5, I: 250, D: 0.02, frequency: 250 },
     primaryOutput: { key: 'P', label: 'Drive', unit: '', min: -50, max: 50, step: 1 },
     secondaryOutput: null,
     valveToggle: false

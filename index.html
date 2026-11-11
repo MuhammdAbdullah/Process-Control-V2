@@ -251,6 +251,7 @@
             <li><a href="#" data-page="pct-main" data-app="main" class="sidebar-link">🌡️ Main App</a></li>
             <li><a href="#" data-page="ws-1" data-app="curriculum" class="sidebar-link">📚 Curriculum</a></li>
             <li><a href="#" data-page="admin" data-app="admin" class="sidebar-link">🔧 Admin</a></li>
+            <li id="hardwareSelectionNav" class="hidden"><a href="#" class="sidebar-link">🧭 Hardware Selection</a></li>
         </ul>
 
         <!-- Scrollable menu -->
@@ -294,7 +295,6 @@
                     </span>
                 </li>
                 <li><a href="#" data-page="admin" data-admin-tab="dashboard" class="sidebar-link">📊 Dashboard</a></li>
-                <li><a href="#" data-page="admin" data-admin-tab="pid" class="sidebar-link">🎛️ PID Controls</a></li>
                 <li><a href="#" data-page="admin" data-admin-tab="bootloader" class="sidebar-link">🔧 Bootloader</a></li>
                 <li><a href="#" data-page="admin" data-admin-tab="updates" class="sidebar-link">🔄 Updates</a></li>
             </ul>
@@ -655,8 +655,6 @@
                     <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-primary active whitespace-nowrap"
                             onclick="switchTab('dashboard', this)">📊 Dashboard</button>
                     <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-transparent whitespace-nowrap"
-                            onclick="switchTab('pid', this)">🎛️ PID Controls</button>
-                    <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-transparent whitespace-nowrap"
                             onclick="switchTab('bootloader', this)">🔧 Bootloader</button>
                     <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-transparent whitespace-nowrap"
                             onclick="switchTab('updates', this)">🔄 Updates</button>
@@ -725,69 +723,6 @@
                         </div>
                     </div>
                 </div><!-- /dashboardTab -->
-
-                <!-- PID CONTROLS TAB -->
-                <div id="pidTab" class="tab-content">
-                    <div class="card bg-base-200 shadow max-w-lg">
-                        <div class="card-body gap-4">
-                            <h2 class="card-title text-base border-b border-success pb-3">🎛️ PID Control Settings</h2>
-                            <div class="space-y-1">
-                                <label class="label pb-0" for="adminPidProduct"><span class="label-text font-semibold">Product:</span></label>
-                                <select id="adminPidProduct" class="select select-bordered select-sm w-full">
-                                    <option value="temperature">201 — Temperature</option>
-                                    <option value="pressure">202 — Pressure</option>
-                                    <option value="level">203 — Level</option>
-                                    <option value="flow">204 — Flow</option>
-                                    <option value="servo-speed">205 — Servo Speed</option>
-                                    <option value="servo-angle">206 — Servo Angle</option>
-                                </select>
-                            </div>
-                            <div class="space-y-1">
-                                <label class="label pb-0" for="proportionalInput">
-                                    <span class="label-text font-semibold">Proportional (P):</span>
-                                </label>
-                                <div class="flex items-center gap-3">
-                                    <input type="text" id="proportionalInput" placeholder="Enter float value (e.g., 1.5)"
-                                           class="input input-bordered input-sm flex-1">
-                                    <span class="pid-status" id="proportionalStatus"></span>
-                                </div>
-                            </div>
-                            <div class="space-y-1">
-                                <label class="label pb-0" for="integralInput">
-                                    <span class="label-text font-semibold">Integral (I):</span>
-                                </label>
-                                <div class="flex items-center gap-3">
-                                    <input type="text" id="integralInput" placeholder="Enter float value (e.g., 0.1)"
-                                           class="input input-bordered input-sm flex-1">
-                                    <span class="pid-status" id="integralStatus"></span>
-                                </div>
-                            </div>
-                            <div class="space-y-1">
-                                <label class="label pb-0" for="differentialInput">
-                                    <span class="label-text font-semibold">Differential (D):</span>
-                                </label>
-                                <div class="flex items-center gap-3">
-                                    <input type="text" id="differentialInput" placeholder="Enter float value (e.g., 0.05)"
-                                           class="input input-bordered input-sm flex-1">
-                                    <span class="pid-status" id="differentialStatus"></span>
-                                </div>
-                            </div>
-                            <div class="space-y-1">
-                                <label class="label pb-0" for="adminPidFrequency"><span class="label-text font-semibold">Frequency (Hz):</span></label>
-                                <input type="number" id="adminPidFrequency" min="0.2" max="1000" step="0.01" class="input input-bordered input-sm w-full">
-                            </div>
-                            <p class="text-xs text-base-content/50 mt-1">
-                                Values are saved as defaults for the selected product and sent when that product enters PID mode.
-                            </p>
-                            <div class="card-actions justify-end mt-2">
-                                <button id="pidRestoreDefaultsBtn" class="btn btn-sm btn-outline btn-warning">
-                                    Restore to Default
-                                </button>
-                                <span id="pidRestoreStatus" class="text-xs self-center"></span>
-                            </div>
-                        </div>
-                    </div>
-                </div><!-- /pidTab -->
 
                 <!-- BOOTLOADER TAB -->
                 <div id="bootloaderTab" class="tab-content">
@@ -915,6 +850,17 @@
                             </div>
                         </div>
 
+                        <div class="card bg-base-200 shadow">
+                            <div class="card-body gap-3">
+                                <h2 class="card-title text-base border-b border-success pb-3">🧭 Hardware Selection</h2>
+                                <label class="flex items-center gap-3 cursor-pointer">
+                                    <input type="checkbox" id="showHardwareSelection" class="toggle toggle-primary">
+                                    <span class="label-text">Show Hardware Selection in sidebar</span>
+                                </label>
+                                <p class="text-xs text-base-content/50">Enable this only when one computer is used to configure multiple hardware units.</p>
+                            </div>
+                        </div>
+
                         <!-- Hardware ID Assignment -->
                         <div class="card bg-base-200 shadow">
                             <div class="card-body gap-4">
@@ -968,6 +914,19 @@
                                 <p class="text-xs text-base-content/50">
                                     This setting is saved and applied automatically each time you connect to hardware.
                                 </p>
+                            </div>
+                        </div>
+
+                        <!-- Temperature PID defaults -->
+                        <div class="card bg-base-200 shadow">
+                            <div class="card-body gap-4">
+                                <h2 class="card-title text-base border-b border-success pb-3">🎛️ PID Defaults — Temperature</h2>
+                                <p class="text-xs text-base-content/60">These values belong to Temperature hardware and are sent when PID mode starts.</p>
+                                <div class="space-y-1"><label class="label pb-0" for="proportionalInput"><span class="label-text font-semibold">Proportional (P):</span></label><div class="flex items-center gap-3"><input type="text" id="proportionalInput" class="input input-bordered input-sm flex-1"><span class="pid-status" id="proportionalStatus"></span></div></div>
+                                <div class="space-y-1"><label class="label pb-0" for="integralInput"><span class="label-text font-semibold">Integral (I):</span></label><div class="flex items-center gap-3"><input type="text" id="integralInput" class="input input-bordered input-sm flex-1"><span class="pid-status" id="integralStatus"></span></div></div>
+                                <div class="space-y-1"><label class="label pb-0" for="differentialInput"><span class="label-text font-semibold">Differential (D):</span></label><div class="flex items-center gap-3"><input type="text" id="differentialInput" class="input input-bordered input-sm flex-1"><span class="pid-status" id="differentialStatus"></span></div></div>
+                                <div class="space-y-1"><label class="label pb-0" for="adminPidFrequency"><span class="label-text font-semibold">Frequency (Hz):</span></label><input type="number" id="adminPidFrequency" min="0.2" max="1000" step="0.01" class="input input-bordered input-sm w-full"></div>
+                                <div class="card-actions justify-end mt-2"><button id="pidRestoreDefaultsBtn" class="btn btn-sm btn-outline btn-warning">Restore to Default</button><span id="pidRestoreStatus" class="text-xs self-center"></span></div>
                             </div>
                         </div>
 
@@ -3495,6 +3454,11 @@
         hwSelect.addEventListener('change', function() {
             var type = hwSelect.value;
             var code = hwTypeCodes[type];
+            var label = hwSelect.options[hwSelect.selectedIndex] ? hwSelect.options[hwSelect.selectedIndex].textContent.trim() : type;
+            if (!window.confirm('Are you sure the connected hardware is ' + label + '?')) {
+                hwSelect.value = 'temperature';
+                return;
+            }
             function doNavigate() {
                 if (type === 'temperature') return; // already here
                 window._skipDisconnectOnUnload = true;
@@ -3517,6 +3481,28 @@
             } else {
                 doNavigate();
             }
+        });
+    }
+
+    var hardwareSelectionNav = document.getElementById('hardwareSelectionNav');
+    var showHardwareSelection = document.getElementById('showHardwareSelection');
+    function updateHardwareSelectionNav() {
+        var enabled = localStorage.getItem('show-hardware-selection') === 'true';
+        if (hardwareSelectionNav) hardwareSelectionNav.classList.toggle('hidden', !enabled);
+        if (showHardwareSelection) showHardwareSelection.checked = enabled;
+    }
+    updateHardwareSelectionNav();
+    if (showHardwareSelection) {
+        showHardwareSelection.addEventListener('change', function () {
+            localStorage.setItem('show-hardware-selection', showHardwareSelection.checked ? 'true' : 'false');
+            updateHardwareSelectionNav();
+        });
+    }
+    if (hardwareSelectionNav) {
+        hardwareSelectionNav.addEventListener('click', function (event) {
+            event.preventDefault();
+            if (window.electronAPI && window.electronAPI.loadHardwareSelection) window.electronAPI.loadHardwareSelection();
+            else window.location.href = 'landing.html';
         });
     }
 })();

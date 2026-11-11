@@ -81,11 +81,15 @@
             <li><a href="#" data-page="pct-main" data-app="main" class="sidebar-link">⚡ Main App</a></li>
             <li><a href="#" data-page="ws-1" data-app="curriculum" class="sidebar-link">📚 Curriculum</a></li>
             <li><a href="#" data-page="admin" data-app="admin" class="sidebar-link">🔧 Admin</a></li>
+            <li id="hardwareSelectionNav" class="hidden"><a href="#" class="sidebar-link">🧭 Hardware Selection</a></li>
         </ul>
         <div class="flex-1 overflow-y-auto">
             <ul class="menu p-3 gap-1" id="sidebar-main">
                 <li class="menu-title">HMI Dashboard</li>
                 <li><a href="#" data-page="pct-main" class="sidebar-link active">⚡ Pressure Control</a></li>
+                <li id="pressureIntegralWindupItem" class="hidden">
+                    <button id="pressureIntegralWindupBtn" class="w-full text-left">Integral Windup DISABLED</button>
+                </li>
             </ul>
             <ul class="menu p-3 gap-1 hidden" id="sidebar-admin">
                 <li class="menu-title">Admin Panels</li>
@@ -110,7 +114,7 @@
                     <div class="card-body p-4 text-center gap-1">
                         <div class="text-xs font-bold tracking-widest uppercase opacity-50">Pressure</div>
                         <div class="font-mono font-extrabold tracking-tight tabular-nums" style="font-size:64px;line-height:1;">
-                            <span id="sensorValueBig">--.-</span><span style="font-size:40px;" class="font-extrabold"> PSI</span>
+                            <span id="sensorValueBig">--.-</span><span style="font-size:40px;" class="font-extrabold pressure-unit-suffix"> PSI</span>
                         </div>
                         <div class="divider my-1"></div>
                         <div class="flex items-center justify-center gap-2">
@@ -157,7 +161,7 @@
                     <div class="card bg-base-300 shadow">
                         <div class="card-body p-4 gap-3">
                             <div class="text-xs font-bold tracking-widest uppercase opacity-50">Valve Control</div>
-                            <button id="valveToggleBtn" class="btn btn-error btn-sm w-full">Valve: CLOSED</button>
+                            <button id="valveToggleBtn" class="btn btn-success btn-sm w-full">Valve: OPEN</button>
                         </div>
                     </div>
                 </div>
@@ -172,7 +176,7 @@
                                 <div class="flex items-center gap-1 flex-shrink-0">
                                     <input type="number" id="onoffSetpointDisplay" min="0" max="12" value="0" step="1"
                                            class="input input-bordered input-sm w-16 text-center font-mono tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none">
-                                    <span class="text-sm font-bold opacity-60">PSI</span>
+                                    <span class="text-sm font-bold opacity-60 pressure-unit-suffix">PSI</span>
                                 </div>
                             </div>
                             <div class="flex items-center gap-3">
@@ -191,7 +195,7 @@
                     <div class="card bg-base-300 shadow">
                         <div class="card-body p-4 gap-3">
                             <div class="text-xs font-bold tracking-widest uppercase opacity-50">Valve Control</div>
-                            <button id="onoffValveBtn" class="btn btn-error btn-sm w-full">Valve: CLOSED</button>
+                            <button id="onoffValveBtn" class="btn btn-success btn-sm w-full">Valve: OPEN</button>
                         </div>
                     </div>
                 </div>
@@ -206,7 +210,7 @@
                                 <div class="flex items-center gap-1 flex-shrink-0">
                                     <input type="number" id="pidSetpointDisplay" min="0" max="12" value="0" step="1"
                                            class="input input-bordered input-sm w-16 text-center font-mono tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none">
-                                    <span class="text-sm font-bold opacity-60">PSI</span>
+                                    <span class="text-sm font-bold opacity-60 pressure-unit-suffix">PSI</span>
                                 </div>
                             </div>
                         </div>
@@ -214,7 +218,7 @@
                     <div class="card bg-base-300 shadow">
                         <div class="card-body p-4 gap-3">
                             <div class="text-xs font-bold tracking-widest uppercase opacity-50">Valve Control</div>
-                            <button id="pidValveBtn" class="btn btn-error btn-sm w-full">Valve: CLOSED</button>
+                            <button id="pidValveBtn" class="btn btn-success btn-sm w-full">Valve: OPEN</button>
                         </div>
                     </div>
                     <div class="card bg-base-300 shadow">
@@ -417,7 +421,7 @@ window.HARDWARE_CONFIG = {
     type: 'pressure',
     name: 'Pressure',
     icon: '⚡',
-    sensor: { label: 'Pressure', unit: 'PSI', min: 0, max: 12, decimals: 0 },
+    sensor: { label: 'Pressure', unit: 'PSI', min: 0, max: 12, decimals: 1 },
     pidDefaults: { P: 5, I: 0.5, D: 0, frequency: 5 },
     primaryOutput: { key: 'P', label: 'Pump', unit: '%', min: 0, max: 100, step: 1 },
     secondaryOutput: { key: 'F', label: 'Relief Valve', unit: '%', min: 0, max: 100, step: 100 },

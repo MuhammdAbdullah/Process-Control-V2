@@ -23,15 +23,24 @@
   var csvRows = [];
   var csvSessionMode = null;
   var csvSavePath = null; // path chosen at Start (Electron only); rows are appended to disk as they arrive
-  var valveOpen = false;
+  // Pressure starts in the firmware-safe relief-open state.
+  var valveOpen = CFG.type === 'pressure';
+  // Do not let stale/inverted pressure telemetry repaint the command state.
+  var valveStateUserControlled = CFG.type === 'pressure';
   var lastSetpoint = null;
   var lastHysteresis = 1;
+  var pressureUnit = localStorage.getItem('pressure-unit') || 'PSI';
+  var PSI_TO_MBAR = 68.9475729;
+  var sensorScaleStorageKey = 'sensor-scale-' + CFG.type;
+  var sensorScaleFactor = parseFloat(localStorage.getItem(sensorScaleStorageKey));
+  if (!isFinite(sensorScaleFactor) || sensorScaleFactor <= 0) sensorScaleFactor = 1;
 
   // PID state — hardware sends two separate JSON messages per cycle
   // First: {T, P, F}  Second: {Pr, It, Dr, Ot}
   var lastPidValues = { proportional: 0, integral: 0, derivative: 0, output: 0 };
   var currentPidControlType = 'PID'; // 'P' | 'PI' | 'PD' | 'PID'
   var lastPidFrequency = 1;
+  var integralWindupNextValue = 1;
 
   var api = window.electronAPI || null;
   var isElectron = !!api;
@@ -167,6 +176,7 @@
         // Reset UI to manual without sending any serial commands yet
         currentMode = 'manual';
         skipNextPoint = true;
+        updateIntegralWindupVisibility();
         document.querySelectorAll('.mode-btn').forEach(function(btn) {
           var active = btn.getAttribute('data-mode') === 'manual';
           btn.classList.toggle('btn-active', active);
@@ -184,17 +194,24 @@
           // Firmware only writes the PWM/output register when the incoming value
           // differs from its last-cached value. Send safe output resets before the
           // mode command so selecting Manual cannot briefly leave a pump enabled.
-          if (CFG.valveToggle) queueSend({ H: 0 }, 'Valve closed');
-          if (CFG.secondaryOutput) {
+          // Pressure safe state is an open relief valve.
+          if (CFG.valveToggle) queueSend({ H: 1 }, 'Valve open');
+          if (CFG.secondaryOutput && CFG.type !== 'pressure') {
             queueSend({ F: 1 }, CFG.secondaryOutput.label + ' force update');
             queueSend({ F: 0 }, CFG.secondaryOutput.label);
           }
+          if (CFG.type === 'pressure') queueSend({ H: 1 }, 'Valve open final state');
           queueSend({ P: 1 }, CFG.primaryOutput.label + ' force update');
           queueSend({ P: 0 }, CFG.primaryOutput.label);
           var safeSetpoint = safeSetpointValue();
           queueSend({ T: pulseSetpointValue(safeSetpoint) }, 'Setpoint force update');
           queueSend({ T: safeSetpoint }, 'Setpoint');
+          if (CFG.type === 'pressure') queueSend({ U: pressureUnit === 'mbar' ? 1 : 0 }, 'Pressure unit');
+          if (CFG.type === 'pressure' || CFG.type === 'level' || CFG.type === 'flow') {
+            queueSend({ SF: sensorScaleFactor }, 'Sensor scale factor');
+          }
           queueSend({ C: 1 }, 'Control Mode');
+          if (CFG.type === 'pressure') queueSend({ H: 1 }, 'Valve open after mode reset');
           addLog('Device connected — charts cleared, reset to Manual mode', 'info');
         }, 1000);
       } else {
@@ -211,19 +228,83 @@
   }
 
   // ── Sensor / setpoint display ─────────────────────────────────────────────────
+  function pressureDisplayDecimals() {
+    return CFG.type === 'pressure' ? (pressureUnit === 'PSI' ? 1 : 0) : null;
+  }
+
   function showSensor(val) {
     var display = el('sensorValueBig');
-    var dec = (CFG.sensor.decimals !== undefined) ? CFG.sensor.decimals : 1;
+    var pressureDec = pressureDisplayDecimals();
+    var dec = pressureDec !== null ? pressureDec :
+      ((CFG.sensor.decimals !== undefined) ? CFG.sensor.decimals : 1);
     if (display) display.textContent = (typeof val === 'number') ? val.toFixed(dec) : '--.-';
     var ts = el('lastUpdate');
     if (ts && typeof val === 'number') ts.textContent = new Date().toLocaleTimeString();
   }
 
+  function pressureUnitInfo() {
+    return pressureUnit === 'mbar'
+      ? { flag: 1, unit: 'mbar', max: 12 * PSI_TO_MBAR }
+      : { flag: 0, unit: 'PSI', max: 12 };
+  }
+
+  function applyPressureUnit(unit, sendToFirmware) {
+    if (CFG.type !== 'pressure') return;
+    var next = unit === 'mbar' ? 'mbar' : 'PSI';
+    if (next === pressureUnit && !sendToFirmware && CFG.sensor.unit === next) return;
+    var ratio = next === 'mbar' ? PSI_TO_MBAR : (1 / PSI_TO_MBAR);
+    ['onoffSetpointSlider', 'onoffSetpointDisplay', 'pidSetpointSlider', 'pidSetpointDisplay'].forEach(function (id) {
+      var input = el(id);
+      if (!input) return;
+      var value = parseFloat(input.value);
+      if (!isNaN(value)) input.value = Math.round(value * ratio);
+    });
+    if (typeof lastSetpoint === 'number') lastSetpoint *= ratio;
+    pressureUnit = next;
+    localStorage.setItem('pressure-unit', pressureUnit);
+    var info = pressureUnitInfo();
+    CFG.sensor.unit = info.unit;
+    CFG.sensor.max = info.max;
+    CFG.sensor.decimals = next === 'PSI' ? 1 : 0;
+    document.querySelectorAll('.pressure-unit-suffix').forEach(function (node) { node.textContent = ' ' + info.unit; });
+    ['onoffSetpointSlider', 'onoffSetpointDisplay', 'pidSetpointSlider', 'pidSetpointDisplay'].forEach(function (id) {
+      var control = el(id);
+      if (control) { control.min = '0'; control.max = String(info.max); control.step = '1'; }
+    });
+    var hysteresis = el('onoffHysteresis');
+    if (hysteresis) {
+      var hystValues = [0.5, 1, 1.5, 2, 3, 5];
+      var selectedHyst = (typeof lastHysteresis === 'number' ? lastHysteresis : 1) * ratio;
+      hysteresis.innerHTML = '';
+      hystValues.forEach(function (base) {
+        var value = base * (pressureUnit === 'mbar' ? PSI_TO_MBAR : 1);
+        var option = document.createElement('option');
+        option.value = String(value);
+        option.textContent = (pressureUnit === 'mbar' ? value.toFixed(1) : base) + ' ' + info.unit;
+        option.selected = Math.abs(value - selectedHyst) < 0.001;
+        hysteresis.appendChild(option);
+      });
+      lastHysteresis = selectedHyst;
+    }
+    var unitSelect = el('pressureUnitSelect');
+    if (unitSelect) unitSelect.value = pressureUnit;
+    showSetpoint(typeof lastSetpoint === 'number' ? lastSetpoint : null);
+    if (sendToFirmware) {
+      queueSend({ U: info.flag }, 'Pressure unit');
+      if (typeof lastSetpoint === 'number') queueSend({ T: lastSetpoint }, 'Pressure setpoint in new unit');
+      if (typeof lastHysteresis === 'number') queueSend({ Y: lastHysteresis }, 'Pressure hysteresis in new unit');
+    }
+    initCharts(currentMode);
+    if (typeof info.flag === 'number') addLog('Pressure unit: ' + info.unit, 'info');
+  }
+
   function showSetpoint(val) {
     var display = el('setpointBig');
     if (!display) return;
+    var pressureDec = pressureDisplayDecimals();
+    var dec = pressureDec !== null ? pressureDec : 1;
     display.textContent = (typeof val === 'number')
-      ? (val.toFixed(1) + ' ' + CFG.sensor.unit)
+      ? (val.toFixed(dec) + ' ' + CFG.sensor.unit)
       : ('-- ' + CFG.sensor.unit);
   }
 
@@ -234,13 +315,27 @@
     if (display) display.value = value;
   }
 
-  function closeValveButtons() {
-    valveOpen = false;
+  function openValveButtons() {
+    valveOpen = true;
+    valveStateUserControlled = true;
     ['valveToggleBtn', 'onoffValveBtn', 'pidValveBtn'].forEach(function (id) {
       var btn = el(id);
       if (!btn) return;
-      btn.textContent = 'Valve: CLOSED';
-      btn.className = 'btn btn-sm w-full btn-error';
+      btn.textContent = 'Valve: OPEN';
+      btn.className = 'btn btn-sm w-full btn-success';
+    });
+  }
+
+  function updateValveButtonsFromTelemetry(value) {
+    if (CFG.type !== 'pressure' || valveStateUserControlled || typeof value !== 'number' || isNaN(value)) return;
+    // Pressure relief valve convention: F=0 is OPEN, F=100 is CLOSED.
+    if (value !== 0 && value !== 100) return;
+    valveOpen = value === 0;
+    ['valveToggleBtn', 'onoffValveBtn', 'pidValveBtn'].forEach(function (id) {
+      var btn = el(id);
+      if (!btn) return;
+      btn.textContent = valveOpen ? 'Valve: OPEN' : 'Valve: CLOSED';
+      btn.className = 'btn btn-sm w-full ' + (valveOpen ? 'btn-success' : 'btn-error');
     });
   }
 
@@ -265,19 +360,21 @@
     setControlValue('pidSecondarySlider', 'pidSecondaryDisplay', 0);
     setControlValue('onoffSetpointSlider', 'onoffSetpointDisplay', safeSetpoint);
     setControlValue('pidSetpointSlider', 'pidSetpointDisplay', safeSetpoint);
-    closeValveButtons();
+    openValveButtons();
 
     lastSetpoint = safeSetpoint;
     showSetpoint(safeSetpoint);
     lastPidValues = { proportional: 0, integral: 0, derivative: 0, output: 0 };
 
-    if (CFG.valveToggle) queueSend({ H: 0 }, 'Valve closed');
-    if (CFG.secondaryOutput) {
+    if (CFG.valveToggle) queueSend({ H: 1 }, 'Valve open');
+    if (CFG.secondaryOutput && CFG.type !== 'pressure') {
       queueSend({ F: 1 }, CFG.secondaryOutput.label + ' force update');
       queueSend({ F: 0 }, CFG.secondaryOutput.label);
     }
+    if (CFG.type === 'pressure') queueSend({ H: 1 }, 'Valve open final state');
     queueSend({ P: 1 }, CFG.primaryOutput.label + ' force update');
     queueSend({ P: 0 }, CFG.primaryOutput.label);
+    if (typeof lastHysteresis === 'number') queueSend({ Y: lastHysteresis }, 'Hysteresis');
     queueSend({ T: pulseSetpointValue(safeSetpoint) }, 'Setpoint force update');
     queueSend({ T: safeSetpoint }, 'Setpoint');
   }
@@ -288,6 +385,30 @@
     if (pC) pC.style.display = 'flex';
     if (iC) iC.style.display = (ct === 'PI' || ct === 'PID') ? 'flex' : 'none';
     if (dC) dC.style.display = (ct === 'PD' || ct === 'PID') ? 'flex' : 'none';
+  }
+
+  function updateIntegralWindupVisibility() {
+    var item = el('pressureIntegralWindupItem');
+    var button = el('pressureIntegralWindupBtn');
+    if (!item || !button) return;
+    var show = CFG.type === 'pressure' && currentMode === 'pid';
+    item.classList.toggle('hidden', !show);
+    if (!show) {
+      integralWindupNextValue = 1;
+      button.textContent = 'Integral Windup DISABLED';
+    }
+  }
+
+  function bindIntegralWindupButton() {
+    var button = el('pressureIntegralWindupBtn');
+    if (!button) return;
+    button.addEventListener('click', function () {
+      var value = integralWindupNextValue;
+      integralWindupNextValue = value === 1 ? 2 : 1;
+      button.textContent = 'Integral Windup ' + (value === 1 ? 'ENABLED' : 'DISABLED');
+      queueSend({ W: value }, 'Pressure Integral Windup ' + (value === 1 ? 'enabled' : 'disabled'));
+      addLog('Pressure Integral Windup: ' + (value === 1 ? 'ENABLED' : 'DISABLED'), 'info');
+    });
   }
 
   // ── Chart legend builder (matches renderer.js exactly) ───────────────────────
@@ -367,7 +488,6 @@
         if (ref.data && ref.data.datasets) {
           ref.data.datasets.forEach(function (d) { d.data = []; });
         }
-        ref.update('none');
         ref.destroy();
       } catch (e) {}
     }
@@ -500,7 +620,7 @@
     // On/Off adds hysteresis band line
     if (mode === 'onoff') {
       primaryDatasets.push({
-        label: 'Hysteresis Low',
+        label: CFG.type === 'pressure' ? 'Hysteresis' : 'Hysteresis Low',
         data: [],
         borderColor: 'rgb(249, 115, 22)',
         backgroundColor: 'transparent',
@@ -580,7 +700,8 @@
     } else if (CFG.secondaryOutput) {
       // Level / Flow: primary output + valve %
       var outLabel = CFG.primaryOutput.label + ' (' + CFG.primaryOutput.unit + ')';
-      var valLabel = CFG.secondaryOutput.label + ' (' + CFG.secondaryOutput.unit + ')';
+      var valLabel = CFG.type === 'pressure' ? 'Relief Valve: OPEN' :
+        CFG.secondaryOutput.label + ' (' + CFG.secondaryOutput.unit + ')';
       secondaryDatasets = [
         { label: outLabel,   data: [], borderColor: 'rgb(16, 185, 129)', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: false, hidden: false },
         { label: valLabel,   data: [], borderColor: 'rgb(251, 191, 36)', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 0, tension: 0.35, fill: false, hidden: false }
@@ -676,7 +797,18 @@
       }
     } else if (CFG.secondaryOutput) {
       if (liveChartRef.data.datasets[0]) liveChartRef.data.datasets[0].data.push(outputVal);
-      if (liveChartRef.data.datasets[1]) liveChartRef.data.datasets[1].data.push(typeof valveVal === 'number' ? valveVal : 0);
+      if (liveChartRef.data.datasets[1]) {
+        // Pressure H is the relief-valve command; plot its discrete state
+        // directly so the graph changes immediately with the valve button.
+        var plottedValveVal = CFG.type === 'pressure'
+          ? (valveOpen ? 0 : 100)
+          : (typeof valveVal === 'number' ? valveVal : 0);
+        liveChartRef.data.datasets[1].data.push(plottedValveVal);
+        if (CFG.type === 'pressure') {
+          var valveStatus = pressureValveStatus(plottedValveVal);
+          if (valveStatus) liveChartRef.data.datasets[1].label = 'Relief Valve: ' + valveStatus;
+        }
+      }
     } else {
       if (liveChartRef.data.datasets[0]) liveChartRef.data.datasets[0].data.push(outputVal);
     }
@@ -723,7 +855,8 @@
         );
       }
       if (CFG.secondaryOutput) {
-        csvRow.push(typeof valveVal === 'number' ? valveVal.toFixed(2) : '');
+        csvRow.push(CFG.type === 'pressure' ? pressureValveStatus(valveOpen ? 0 : 100) :
+          (typeof valveVal === 'number' ? valveVal.toFixed(2) : ''));
       }
       var csvLine = csvRow.join(',');
       if (csvSavePath && api && api.appendFile) {
@@ -774,11 +907,15 @@
       return; // wait for the main T/P/F message to add chart point
     }
 
+    if (CFG.type === 'pressure' && (data.U === 0 || data.U === 1)) applyPressureUnit(data.U === 1 ? 'mbar' : 'PSI', false);
     var sensorVal = (typeof data.T === 'number') ? data.T : null;
+    // Flow calibration is applied in the app; pressure and level are calibrated in firmware.
+    if (sensorVal !== null && CFG.type === 'flow') sensorVal *= sensorScaleFactor;
     var outputVal = (typeof data.P === 'number') ? data.P : null;
     var valveVal  = (typeof data.F === 'number') ? data.F : null;
 
     if (sensorVal !== null) showSensor(sensorVal);
+    updateValveButtonsFromTelemetry(valveVal);
 
     addChartPoint(sensorVal, outputVal, valveVal);
     addRawData(JSON.stringify(data));
@@ -790,14 +927,27 @@
 
     currentMode = mode;
     skipNextPoint = true;
+    updateIntegralWindupVisibility();
 
     var modeCode = mode === 'manual' ? 1 : mode === 'onoff' ? 2 : 3;
     if (mode === 'pid') {
       loadProductPidValues();
       lastPidValues = { proportional: 0, integral: 0, derivative: 0, output: 0 };
       queueSend({ W: 2 }, 'PID Integral Reset');
+      // Configure the PID interrupt before enabling PID mode. Starting C:3
+      // first can briefly run the firmware with the previous loop period.
+      commitPID();
+      var freqEl = el('pidFrequency');
+      if (freqEl) {
+        var freqVal = parseFloat(freqEl.value);
+        if (!isNaN(freqVal) && freqVal > 0) queueSend({ PID_Hz: freqVal }, 'PID Frequency');
+      }
+      queueSend({ C: modeCode }, 'Control Mode');
+      if (CFG.type === 'pressure') queueSend({ H: 1 }, 'Valve open after mode change');
+    } else {
+      queueSend({ C: modeCode }, 'Control Mode');
+      if (CFG.type === 'pressure') queueSend({ H: 1 }, 'Valve open after mode change');
     }
-    queueSend({ C: modeCode }, 'Control Mode');
 
     // Update button styles
     document.querySelectorAll('.mode-btn').forEach(function (btn) {
@@ -813,15 +963,6 @@
     });
 
     initCharts(mode);
-
-    if (mode === 'pid') {
-      commitPID();
-      var freqEl = el('pidFrequency');
-      if (freqEl) {
-        var freqVal = parseFloat(freqEl.value);
-        if (!isNaN(freqVal) && freqVal > 0) queueSend({ PID_Hz: freqVal }, 'PID Frequency');
-      }
-    }
 
     addLog('Switched to ' + mode.toUpperCase() + ' mode', 'info');
   }
@@ -893,11 +1034,39 @@
     }
   }
 
+  function bindOnOffSetpoint() {
+    var slider = el('onoffSetpointSlider');
+    var display = el('onoffSetpointDisplay');
+    if (!slider) return;
+    function updateDisplay() {
+      var val = parseFloat(slider.value);
+      if (display) display.value = val;
+      lastSetpoint = val;
+      showSetpoint(val);
+    }
+    function send() {
+      updateDisplay();
+      queueSend({ T: parseFloat(slider.value), Y: lastHysteresis }, 'Setpoint + Hysteresis');
+    }
+    slider.addEventListener('input', updateDisplay);
+    slider.addEventListener('change', send);
+    updateDisplay();
+    if (display) {
+      display.addEventListener('change', function () {
+        var v = Math.min(Math.max(parseFloat(display.value), parseFloat(slider.min)), parseFloat(slider.max));
+        display.value = v;
+        slider.value = v;
+        send();
+      });
+    }
+  }
+
   // ── Valve toggle helper ───────────────────────────────────────────────────────
   function bindValveToggle(btnId) {
     var btn = el(btnId);
     if (!btn) return;
     btn.addEventListener('click', function () {
+      valveStateUserControlled = true;
       valveOpen = !valveOpen;
       btn.textContent = valveOpen ? 'Valve: OPEN' : 'Valve: CLOSED';
       btn.className   = 'btn btn-sm w-full ' + (valveOpen ? 'btn-success' : 'btn-error');
@@ -1025,13 +1194,21 @@
     }).join(' ');
   }
 
+  function pressureValveStatus(value) {
+    if (typeof value !== 'number' || isNaN(value)) return '';
+    if (value === 0) return 'OPEN';
+    if (value === 100) return 'CLOSED';
+    return 'UNKNOWN';
+  }
+
   function startCsv() {
     csvSessionMode = currentMode;
     var header = 'Timestamp,' + CFG.sensor.label + '(' + CFG.sensor.unit + '),Output' +
       (csvSessionMode !== 'manual' ? ',Setpoint' : '') +
       (csvSessionMode === 'onoff' ? ',Hysteresis(' + CFG.sensor.unit + ')' : '') +
       (csvSessionMode === 'pid' ? ',PIDControlType,PIDOutput,Proportional,Integral,Derivative,PID_Frequency,PID_P_Set,PID_I_Set,PID_D_Set' : '') +
-      (CFG.secondaryOutput ? ',' + CFG.secondaryOutput.label + '(' + CFG.secondaryOutput.unit + ')' : '');
+      (CFG.secondaryOutput ? (CFG.type === 'pressure' ? ',Relief Valve Status' :
+        ',' + CFG.secondaryOutput.label + '(' + CFG.secondaryOutput.unit + ')') : '');
     var filename = 'Process Control ' + typeDisplayName() + ' ' + filenameTimestamp() + '.csv';
 
     if (isElectron && api.showSaveDialog) {
@@ -1098,6 +1275,13 @@
   }
 
   // ── PID commit ────────────────────────────────────────────────────────────────
+  function queuePidParameters(label) {
+    var p = parseFloat((el('pidPInput') || {}).value) || 0;
+    var i = parseFloat((el('pidIInput') || {}).value) || 0;
+    var d = parseFloat((el('pidDInput') || {}).value) || 0;
+    queueSend({ PID_P: p, PID_I: i, PID_D: d }, label || 'PID parameters');
+  }
+
   function commitPID() {
     var p = parseFloat((el('pidPInput') || {}).value) || 0;
     var i = parseFloat((el('pidIInput') || {}).value) || 0;
@@ -1105,9 +1289,7 @@
     saveProductPidValue('P', p);
     saveProductPidValue('I', i);
     saveProductPidValue('D', d);
-    queueSend({ PID_P: p }, 'PID P');
-    queueSend({ PID_I: i }, 'PID I');
-    queueSend({ PID_D: d }, 'PID D');
+    queueSend({ PID_P: p, PID_I: i, PID_D: d }, 'PID parameters');
     addLog('PID committed: P=' + p + ' I=' + i + ' D=' + d, 'success');
   }
 
@@ -1175,7 +1357,6 @@
       <div class="flex flex-wrap items-center gap-y-1">
         <button id="adminBackBtn" class="btn btn-sm btn-primary gap-1 flex-shrink-0 mr-1">← Main App</button>
         <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-primary active whitespace-nowrap" onclick="switchTab('dashboard', this)">📊 Dashboard</button>
-        <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-transparent whitespace-nowrap" onclick="switchTab('pid', this)">🎛️ PID Controls</button>
         <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-transparent whitespace-nowrap" onclick="switchTab('bootloader', this)">🔧 Bootloader</button>
         <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-transparent whitespace-nowrap" onclick="switchTab('updates', this)">🔄 Updates</button>
         <button class="tab-button btn btn-ghost btn-sm rounded-none border-b-2 border-transparent whitespace-nowrap" onclick="switchTab('settings', this)">⚙️ Settings</button>
@@ -1222,54 +1403,6 @@
                 <span class="text-xs opacity-60 mt-1">URL:</span>
                 <a id="webServerUrl" href="#" target="_blank" class="font-mono text-primary text-sm break-all">Waiting for server…</a>
               </div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div id="pidTab" class="tab-content">
-        <div class="card bg-base-200 shadow max-w-lg">
-          <div class="card-body gap-4">
-            <h2 class="card-title text-base border-b border-success pb-3">🎛️ PID Control Settings</h2>
-            <div class="space-y-1">
-              <label class="label pb-0" for="adminPidProduct"><span class="label-text font-semibold">Product:</span></label>
-              <select id="adminPidProduct" class="select select-bordered select-sm w-full">
-                <option value="temperature">201 — Temperature</option>
-                <option value="pressure">202 — Pressure</option>
-                <option value="level">203 — Level</option>
-                <option value="flow">204 — Flow</option>
-                <option value="servo-speed">205 — Servo Speed</option>
-                <option value="servo-angle">206 — Servo Angle</option>
-              </select>
-            </div>
-            <div class="space-y-1">
-              <label class="label pb-0" for="proportionalInput"><span class="label-text font-semibold">Proportional (P):</span></label>
-              <div class="flex items-center gap-3">
-                <input type="text" id="proportionalInput" placeholder="Enter float value (e.g., 1.5)" class="input input-bordered input-sm flex-1">
-                <span class="pid-status" id="proportionalStatus"></span>
-              </div>
-            </div>
-            <div class="space-y-1">
-              <label class="label pb-0" for="integralInput"><span class="label-text font-semibold">Integral (I):</span></label>
-              <div class="flex items-center gap-3">
-                <input type="text" id="integralInput" placeholder="Enter float value (e.g., 0.1)" class="input input-bordered input-sm flex-1">
-                <span class="pid-status" id="integralStatus"></span>
-              </div>
-            </div>
-            <div class="space-y-1">
-              <label class="label pb-0" for="differentialInput"><span class="label-text font-semibold">Differential (D):</span></label>
-              <div class="flex items-center gap-3">
-                <input type="text" id="differentialInput" placeholder="Enter float value (e.g., 0.05)" class="input input-bordered input-sm flex-1">
-                <span class="pid-status" id="differentialStatus"></span>
-              </div>
-            </div>
-            <div class="space-y-1">
-              <label class="label pb-0" for="adminPidFrequency"><span class="label-text font-semibold">Frequency (Hz):</span></label>
-              <input type="number" id="adminPidFrequency" min="0.2" max="1000" step="0.01" class="input input-bordered input-sm w-full">
-            </div>
-            <p class="text-xs text-base-content/50 mt-1">Values are saved as defaults for the selected product and sent when that product enters PID mode.</p>
-            <div class="card-actions justify-end mt-2">
-              <button id="pidRestoreDefaultsBtn" class="btn btn-sm btn-outline btn-warning">Restore to Default</button>
-              <span id="pidRestoreStatus" class="text-xs self-center"></span>
             </div>
           </div>
         </div>
@@ -1376,6 +1509,47 @@
                 <option value="servo-speed">⚙️ Servo – Speed</option>
               </select>
               <p class="text-xs text-base-content/50">Changing this will navigate to the matching hardware page.</p>
+            </div>
+          </div>
+          <div class="card bg-base-200 shadow">
+            <div class="card-body gap-3">
+              <h2 class="card-title text-base border-b border-success pb-3">🧭 Hardware Selection</h2>
+              <label class="flex items-center gap-3 cursor-pointer">
+                <input type="checkbox" id="showHardwareSelection" class="toggle toggle-primary">
+                <span class="label-text">Show Hardware Selection in sidebar</span>
+              </label>
+              <p class="text-xs text-base-content/50">Enable this only when one computer is used to configure multiple hardware units.</p>
+            </div>
+          </div>
+          <div id="pressureUnitCard" class="card bg-base-200 shadow" style="display:none;">
+            <div class="card-body gap-3">
+              <h2 class="card-title text-base border-b border-success pb-3">Pressure Unit</h2>
+              <label class="label pb-0" for="pressureUnitSelect"><span class="label-text font-semibold">Default unit:</span></label>
+              <select id="pressureUnitSelect" class="select select-bordered select-sm w-full">
+                <option value="PSI">PSI</option>
+                <option value="mbar">mbar</option>
+              </select>
+              <p class="text-xs text-base-content/50">Saved in firmware EEPROM and used by pressure control, charts, CSV, and the touch display.</p>
+            </div>
+          </div>
+          <div id="sensorScaleCard" class="card bg-base-200 shadow" style="display:none;">
+            <div class="card-body gap-3">
+              <h2 class="card-title text-base border-b border-success pb-3">Sensor Calibration</h2>
+              <label class="label pb-0" for="sensorScaleFactorInput"><span class="label-text font-semibold">Scale factor:</span></label>
+              <input type="number" id="sensorScaleFactorInput" min="0.0001" max="1000" step="0.0001" class="input input-bordered input-sm w-full">
+              <p class="text-xs text-base-content/50">Measured sensor value is multiplied by this factor. Default: 1.0.</p>
+              <span id="sensorScaleFactorStatus" class="text-xs self-center"></span>
+            </div>
+          </div>
+          <div class="card bg-base-200 shadow">
+            <div class="card-body gap-4">
+              <h2 class="card-title text-base border-b border-success pb-3">🎛️ PID Defaults — ${CFG.name}</h2>
+              <p class="text-xs text-base-content/60">These values belong to this hardware and are sent when PID mode starts.</p>
+              <div class="space-y-1"><label class="label pb-0" for="proportionalInput"><span class="label-text font-semibold">Proportional (P):</span></label><div class="flex items-center gap-3"><input type="text" id="proportionalInput" class="input input-bordered input-sm flex-1"><span class="pid-status" id="proportionalStatus"></span></div></div>
+              <div class="space-y-1"><label class="label pb-0" for="integralInput"><span class="label-text font-semibold">Integral (I):</span></label><div class="flex items-center gap-3"><input type="text" id="integralInput" class="input input-bordered input-sm flex-1"><span class="pid-status" id="integralStatus"></span></div></div>
+              <div class="space-y-1"><label class="label pb-0" for="differentialInput"><span class="label-text font-semibold">Differential (D):</span></label><div class="flex items-center gap-3"><input type="text" id="differentialInput" class="input input-bordered input-sm flex-1"><span class="pid-status" id="differentialStatus"></span></div></div>
+              <div class="space-y-1"><label class="label pb-0" for="adminPidFrequency"><span class="label-text font-semibold">Frequency (Hz):</span></label><input type="number" id="adminPidFrequency" min="0.2" max="1000" step="0.01" class="input input-bordered input-sm w-full"></div>
+              <div class="card-actions justify-end mt-2"><button id="pidRestoreDefaultsBtn" class="btn btn-sm btn-outline btn-warning">Restore to Default</button><span id="pidRestoreStatus" class="text-xs self-center"></span></div>
             </div>
           </div>
         </div>
@@ -1812,6 +1986,9 @@
       btn.addEventListener('click', function () { switchMode(btn.getAttribute('data-mode')); });
     });
 
+    bindIntegralWindupButton();
+    updateIntegralWindupVisibility();
+
     // PID control type selector
     var pidTypeSelect = el('pidControlType');
     if (pidTypeSelect) {
@@ -1845,9 +2022,11 @@
     if (CFG.secondaryOutput) bindSlider('secondarySlider', 'secondaryDisplay', 'F', CFG.secondaryOutput.label);
 
     // ── On/Off controls ──────────────────────────────────────────────────────
-    bindSlider('onoffSetpointSlider', 'onoffSetpointDisplay', 'T', 'Setpoint');
+    bindOnOffSetpoint();
     var onoffHys = el('onoffHysteresis');
     if (onoffHys) {
+      var initialHys = parseFloat(onoffHys.value);
+      if (!isNaN(initialHys)) lastHysteresis = initialHys;
       onoffHys.addEventListener('change', function () {
         lastHysteresis = parseFloat(onoffHys.value);
         queueSend({ Y: lastHysteresis }, 'Hysteresis');
@@ -1868,17 +2047,17 @@
     var pidPInputEl = el('pidPInput');
     if (pidPInputEl) pidPInputEl.addEventListener('change', function () {
       var val = parseFloat(pidPInputEl.value);
-      if (!isNaN(val)) { saveProductPidValue('P', val); queueSend({ PID_P: val }, 'PID P'); }
+      if (!isNaN(val)) { saveProductPidValue('P', val); queuePidParameters('PID P updated'); }
     });
     var pidIInputEl = el('pidIInput');
     if (pidIInputEl) pidIInputEl.addEventListener('change', function () {
       var val = parseFloat(pidIInputEl.value);
-      if (!isNaN(val)) { saveProductPidValue('I', val); queueSend({ PID_I: val }, 'PID I'); }
+      if (!isNaN(val)) { saveProductPidValue('I', val); queuePidParameters('PID I updated'); }
     });
     var pidDInputEl = el('pidDInput');
     if (pidDInputEl) pidDInputEl.addEventListener('change', function () {
       var val = parseFloat(pidDInputEl.value);
-      if (!isNaN(val)) { saveProductPidValue('D', val); queueSend({ PID_D: val }, 'PID D'); }
+      if (!isNaN(val)) { saveProductPidValue('D', val); queuePidParameters('PID D updated'); }
     });
 
     // ── Chart toolbar ────────────────────────────────────────────────────────
@@ -1906,7 +2085,75 @@
     var hwSelect = el('hardwareTypeSelect');
     if (hwSelect) {
       hwSelect.value = CFG.type;
-      hwSelect.addEventListener('change', function () { navigateToHardware(hwSelect.value); });
+      hwSelect.addEventListener('change', function () {
+        var type = hwSelect.value;
+        var label = hwSelect.options[hwSelect.selectedIndex] ? hwSelect.options[hwSelect.selectedIndex].textContent.trim() : type;
+        if (!window.confirm('Are you sure the connected hardware is ' + label + '?')) {
+          hwSelect.value = CFG.type;
+          return;
+        }
+        navigateToHardware(type);
+      });
+    }
+
+    var hardwareSelectionNav = el('hardwareSelectionNav');
+    var showHardwareSelection = el('showHardwareSelection');
+    function updateHardwareSelectionNav() {
+      var enabled = localStorage.getItem('show-hardware-selection') === 'true';
+      if (hardwareSelectionNav) hardwareSelectionNav.classList.toggle('hidden', !enabled);
+      if (showHardwareSelection) showHardwareSelection.checked = enabled;
+    }
+    updateHardwareSelectionNav();
+    if (showHardwareSelection) {
+      showHardwareSelection.addEventListener('change', function () {
+        localStorage.setItem('show-hardware-selection', showHardwareSelection.checked ? 'true' : 'false');
+        updateHardwareSelectionNav();
+      });
+    }
+    if (hardwareSelectionNav) {
+      hardwareSelectionNav.addEventListener('click', function (event) {
+        event.preventDefault();
+        if (isElectron && api.loadHardwareSelection) api.loadHardwareSelection();
+        else window.location.href = 'landing.html';
+      });
+    }
+
+    var pressureUnitCard = el('pressureUnitCard');
+    var pressureUnitSelect = el('pressureUnitSelect');
+    if (pressureUnitCard && CFG.type === 'pressure') {
+      pressureUnitCard.style.display = '';
+      applyPressureUnit(pressureUnit, false);
+      if (pressureUnitSelect) {
+        pressureUnitSelect.value = pressureUnit;
+        pressureUnitSelect.addEventListener('change', function () {
+          applyPressureUnit(pressureUnitSelect.value, true);
+        });
+      }
+    }
+
+    var sensorScaleCard = el('sensorScaleCard');
+    var sensorScaleInput = el('sensorScaleFactorInput');
+    var sensorScaleStatus = el('sensorScaleFactorStatus');
+    var supportsSensorScale = CFG.type === 'pressure' || CFG.type === 'level' || CFG.type === 'flow';
+    if (sensorScaleCard && supportsSensorScale) sensorScaleCard.style.display = '';
+    if (sensorScaleInput && supportsSensorScale) {
+      sensorScaleInput.value = sensorScaleFactor;
+      sensorScaleInput.addEventListener('change', function () {
+        var value = parseFloat(sensorScaleInput.value);
+        if (!isFinite(value) || value <= 0 || value > 1000) {
+          sensorScaleInput.value = sensorScaleFactor;
+          if (sensorScaleStatus) sensorScaleStatus.textContent = 'Enter a value from 0.0001 to 1000';
+          return;
+        }
+        sensorScaleFactor = value;
+        localStorage.setItem(sensorScaleStorageKey, String(value));
+        queueSend({ SF: value }, 'Sensor scale factor');
+        if (sensorScaleStatus) {
+          sensorScaleStatus.textContent = 'Saved: ' + value;
+          setTimeout(function () { sensorScaleStatus.textContent = ''; }, 3000);
+        }
+        addLog(CFG.name + ' sensor scale factor set to ' + value, 'success');
+      });
     }
 
     // ── Hardware ID assignment ───────────────────────────────────────────────

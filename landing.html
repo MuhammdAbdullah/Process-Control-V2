@@ -150,6 +150,7 @@
     .card-desc { font-size: 0.78rem; color: oklch(var(--bc)/0.5); line-height: 1.5; }
     .card-actions { display: flex; gap: 8px; margin-top: auto; }
     .card-actions .btn { flex: 1; font-size: 0.78rem; }
+    .try-app-btn:disabled { cursor: not-allowed; opacity: 0.45; }
 
     /* staggered entrance */
     .product-card { opacity: 0; transform: translateY(24px); animation: card-in 0.5s ease forwards; }
@@ -223,7 +224,7 @@
       <div class="card-name">🌡️ Temperature Control</div>
       <div class="card-desc">Compact benchtop system (CT1491) with a heated plate, dual thermocouples, and adjustable fan for air disturbance. Teaches On/Off, PI, and PID control, Ziegler-Nichols tuning, integral wind-up management, and derivative filtering for thermal process education.</div>
       <div class="card-actions">
-        <button class="btn btn-sm btn-primary" onclick="tryApp('temperature')">▶ Try App</button>
+        <button class="btn btn-sm btn-primary try-app-btn" data-hardware-type="temperature" onclick="tryApp('temperature')">▶ Try App</button>
         <button class="btn btn-sm btn-ghost btn-outline" onclick="viewProduct('https://www.matrixtsl.com/webshop/temperature-control-system/')">🌐 Website</button>
       </div>
     </div>
@@ -238,7 +239,7 @@
       <div class="card-name">📊 Level Control</div>
       <div class="card-desc">Benchtop system (CT5971) with a reservoir tank, variable-speed pump, pressure-based level sensor, clear process vessel, and proportional drain valve. Explores On/Off, PI, and PID control with real water level dynamics, time constant analysis, and Ziegler-Nichols tuning.</div>
       <div class="card-actions">
-        <button class="btn btn-sm btn-primary" onclick="tryApp('level')">▶ Try App</button>
+        <button class="btn btn-sm btn-primary try-app-btn" data-hardware-type="level" onclick="tryApp('level')">▶ Try App</button>
         <button class="btn btn-sm btn-ghost btn-outline" onclick="viewProduct('https://www.matrixtsl.com/webshop/level-control-system/')">🌐 Website</button>
       </div>
     </div>
@@ -253,7 +254,7 @@
       <div class="card-name">⚡ Pressure Control</div>
       <div class="card-desc">Benchtop compressor-driven system (CT1733) with a pressure vessel, Bourdon gauge, electronic sensor, and dual outflow options — manual needle valve or solenoid for step-change disturbances. Covers On/Off, PI, and PID control with integral wind-up and derivative filtering.</div>
       <div class="card-actions">
-        <button class="btn btn-sm btn-primary" onclick="tryApp('pressure')">▶ Try App</button>
+        <button class="btn btn-sm btn-primary try-app-btn" data-hardware-type="pressure" onclick="tryApp('pressure')">▶ Try App</button>
         <button class="btn btn-sm btn-ghost btn-outline" onclick="viewProduct('https://www.matrixtsl.com/webshop/pressure-control-system/')">🌐 Website</button>
       </div>
     </div>
@@ -268,7 +269,7 @@
       <div class="card-name">💧 Flow Control</div>
       <div class="card-desc">Compact benchtop unit (CT0673) with a water tank, variable-speed pump, turbine flow sensor, proportional valve, and variable-area flow meter. Adjust pump speed and valve opening to explore On/Off, PI, and PID flow regulation with Ziegler-Nichols and manual tuning techniques.</div>
       <div class="card-actions">
-        <button class="btn btn-sm btn-primary" onclick="tryApp('flow')">▶ Try App</button>
+        <button class="btn btn-sm btn-primary try-app-btn" data-hardware-type="flow" onclick="tryApp('flow')">▶ Try App</button>
         <button class="btn btn-sm btn-ghost btn-outline" onclick="viewProduct('https://www.matrixtsl.com/webshop/flow-control-system/')">🌐 Website</button>
       </div>
     </div>
@@ -283,7 +284,7 @@
       <div class="card-name">⚙️ Servo / Pendulum</div>
       <div class="card-desc">Dual-mode benchtop system (CT9513) with a DC motor and attachable weighted disc for servo speed control and inverting pendulum position control. Supports USB, Bluetooth, and LAN/Wi-Fi connectivity with full MATLAB and LabVIEW API integration for advanced PID study.</div>
       <div class="card-actions">
-        <button class="btn btn-sm btn-primary" onclick="tryApp('servo-speed')">▶ Try App</button>
+        <button class="btn btn-sm btn-primary try-app-btn" data-hardware-type="servo-speed" onclick="tryApp('servo-speed')">▶ Try App</button>
         <button class="btn btn-sm btn-ghost btn-outline" onclick="viewProduct('https://www.matrixtsl.com/webshop/servo-pendulum-motor-control-system/')">🌐 Website</button>
       </div>
     </div>
@@ -334,6 +335,7 @@
 
   // ── Navigation helpers ──
   function tryApp(type) {
+    if (hwConnected) return;
     const pages = {
       temperature: 'index.html',
       level:       'level.html',
@@ -367,6 +369,13 @@
 
   let hwConnected = false;
 
+  function updateTryButtons() {
+    document.querySelectorAll('.try-app-btn').forEach(btn => {
+      btn.disabled = hwConnected;
+      btn.title = hwConnected ? 'Connect a different device after disconnecting this hardware' : 'Open this hardware app';
+    });
+  }
+
   function setBannerDisconnected() {
     hwConnected = false;
     banner.className = '';
@@ -374,6 +383,7 @@
     bannerTitle.textContent = 'No hardware detected — Connect your Process Control hardware via USB';
     bannerSub.textContent   = 'The app will automatically open the matching interface when a device is detected';
     assignRow.classList.remove('visible');
+    updateTryButtons();
   }
 
   function setBannerConnected() {
@@ -383,6 +393,7 @@
     bannerTitle.textContent = 'Hardware connected — Please assign a hardware type';
     bannerSub.textContent   = 'Select the hardware type and click Assign ID, or wait for the device to broadcast its ID';
     assignRow.classList.add('visible');
+    updateTryButtons();
   }
 
   function setBannerSuccess(name) {
@@ -395,7 +406,10 @@
     const flash = document.getElementById('success-flash');
     flash.classList.add('show');
     setTimeout(() => flash.classList.remove('show'), 600);
+    updateTryButtons();
   }
+
+  updateTryButtons();
 
   // ── Electron event listeners ──
   if (window.electronAPI) {

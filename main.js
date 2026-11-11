@@ -69,6 +69,7 @@ let lastSerialWriteTime = 0; // Prevent command flooding
 let reconnectInProgress = false;
 let reconnectFailureStreak = 0;
 let lastReconnectAttemptTime = 0;
+let autoReconnectTimer = null;
 let activeSerialPath = null;
 let activeSerialBaudRate = 115200;
 const SERIAL_MIN_COMMAND_INTERVAL_MS = 40;
@@ -83,10 +84,32 @@ let hardwareIdReceivedThisConnection = false; // reset per connect; set true onc
 let connectionGeneration = 0; // bumped on every connectSerial() call; lets stale async loops detect they've been superseded
 let lastKnownPorts = [];
 let isConnected = false;
+let appShuttingDown = false;
+let shutdownInProgress = false;
 let lastDataTime = 0;
 let connectionTimeout = 10000; // 10 seconds timeout for connection loss
 const TARGET_VENDOR_ID = '12BF';
 const TARGET_PRODUCT_ID = '0113';
+
+// Compact, documented protocol names used on the firmware wire format.
+const PROTOCOL_COMMAND_KEYS = Object.freeze({
+  C: 'CM', T: 'SP', P: 'PW', F: 'A2', H: 'V2', Y: 'HY',
+  PID_P: 'PP', PID_I: 'PI', PID_D: 'PD', PID_Hz: 'PF',
+  QL: 'HB', W: 'IR', K: 'TU', U: 'PU', SF: 'SF',
+  A: 'HW', REQ_ID: 'RQ', Z: 'ZS'
+});
+
+function encodeProtocolCommand(commandObject) {
+  return Object.fromEntries(Object.entries(commandObject).map(([key, value]) => [
+    PROTOCOL_COMMAND_KEYS[key] || key,
+    value
+  ]));
+}
+
+function normalizeProtocolTelemetry(jsonData) {
+  const keyMap = { SV: 'T', PW: 'P', A2: 'F', UN: 'U', HW: 'A', PP: 'Pr', PI: 'It', PD: 'Dr', PO: 'Ot' };
+  return Object.fromEntries(Object.entries(jsonData).map(([key, value]) => [keyMap[key] || key, value]));
+}
 
 // Maps hardware ID (sent by device as {A: X}) to page file and display name.
 // Values match the {A: 201-206} codes the app already sends when selecting hardware type.
@@ -190,9 +213,21 @@ function createWindow() {
 
   // Handle window closed
   mainWindow.on('close', async (event) => {
+    if (shutdownInProgress) {
+      return;
+    }
+
     // Prevent immediate closing to allow safety commands to complete
     event.preventDefault();
+    shutdownInProgress = true;
+    appShuttingDown = true;
     stopQlHeartbeat();
+    stopPortPolling();
+    stopConnectionMonitoring();
+    if (autoReconnectTimer) {
+      clearTimeout(autoReconnectTimer);
+      autoReconnectTimer = null;
+    }
 
     console.log('[SHUTDOWN] Window closing - Sending safety shutdown commands to hardware...');
 
@@ -201,7 +236,7 @@ function createWindow() {
       if (serialPort && serialPort.isOpen) {
         // 1. Set control mode to Manual (mode = 1)
         console.log('[SHUTDOWN] Setting control mode to Manual (1)...');
-        const controlModeJson = JSON.stringify({ C: 1 });
+        const controlModeJson = JSON.stringify(encodeProtocolCommand({ C: 1 }));
         const controlModePayload = Buffer.from(controlModeJson + '\n', 'utf8');
         await new Promise((resolve, reject) => {
           serialPort.write(controlModePayload, (err) => {
@@ -212,7 +247,7 @@ function createWindow() {
 
         // 2. Fan speed to 0
         console.log('[SHUTDOWN] Setting fan speed to 0%...');
-        const fanJson = JSON.stringify({ F: 0 });
+        const fanJson = JSON.stringify(encodeProtocolCommand({ F: 0 }));
         const fanPayload = Buffer.from(fanJson + '\n', 'utf8');
         await new Promise((resolve, reject) => {
           serialPort.write(fanPayload, (err) => {
@@ -221,9 +256,22 @@ function createWindow() {
         });
         await new Promise(resolve => setTimeout(resolve, 200));
 
+        // Pressure safety state: open the relief valve on application shutdown.
+        // Firmware convention: H=1 opens the pressure relief valve.
+        if (activeHardwareType === 'pressure') {
+          console.log('[SHUTDOWN] Opening pressure relief valve...');
+          const reliefValvePayload = Buffer.from(JSON.stringify(encodeProtocolCommand({ H: 1 })) + '\n', 'utf8');
+          await new Promise((resolve, reject) => {
+            serialPort.write(reliefValvePayload, (err) => {
+              if (err) reject(err); else resolve();
+            });
+          });
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+
         // 3. Power to 0
         console.log('[SHUTDOWN] Setting power to 0%...');
-        const powerJson = JSON.stringify({ P: 0 });
+        const powerJson = JSON.stringify(encodeProtocolCommand({ P: 0 }));
         const powerPayload = Buffer.from(powerJson + '\n', 'utf8');
         await new Promise((resolve, reject) => {
           serialPort.write(powerPayload, (err) => {
@@ -235,7 +283,7 @@ function createWindow() {
         // 4. Setpoint to safe idle value (temperature-specific: 20°C min; all others: 0)
         if (activeHardwareType === 'temperature') {
           console.log('[SHUTDOWN] Setting target temperature to 20°C...');
-          const heaterTempPayload = Buffer.from(JSON.stringify({ T: 20 }) + '\n', 'utf8');
+          const heaterTempPayload = Buffer.from(JSON.stringify(encodeProtocolCommand({ T: 20 })) + '\n', 'utf8');
           await new Promise((resolve, reject) => {
             serialPort.write(heaterTempPayload, (err) => { if (err) reject(err); else resolve(); });
           });
@@ -243,14 +291,14 @@ function createWindow() {
 
           // 5. Heater off (temperature only)
           console.log('[SHUTDOWN] Turning heater OFF...');
-          const heaterOffPayload = Buffer.from(JSON.stringify({ H: 0 }) + '\n', 'utf8');
+          const heaterOffPayload = Buffer.from(JSON.stringify(encodeProtocolCommand({ H: 0 })) + '\n', 'utf8');
           await new Promise((resolve, reject) => {
             serialPort.write(heaterOffPayload, (err) => { if (err) reject(err); else resolve(); });
           });
           await new Promise(resolve => setTimeout(resolve, 200));
         } else {
           console.log(`[SHUTDOWN] Setting setpoint to 0 (${activeHardwareType})...`);
-          const setpointPayload = Buffer.from(JSON.stringify({ T: 0 }) + '\n', 'utf8');
+          const setpointPayload = Buffer.from(JSON.stringify(encodeProtocolCommand({ T: 0 })) + '\n', 'utf8');
           await new Promise((resolve, reject) => {
             serialPort.write(setpointPayload, (err) => { if (err) reject(err); else resolve(); });
           });
@@ -259,7 +307,7 @@ function createWindow() {
 
         // 6. PID P value to 0
         console.log('[SHUTDOWN] Setting PID P to 0...');
-        const pidPJson = JSON.stringify({ PID_P: 0 });
+        const pidPJson = JSON.stringify(encodeProtocolCommand({ PID_P: 0 }));
         const pidPPayload = Buffer.from(pidPJson + '\n', 'utf8');
         await new Promise((resolve, reject) => {
           serialPort.write(pidPPayload, (err) => {
@@ -270,7 +318,7 @@ function createWindow() {
 
         // 7. PID I value to 0
         console.log('[SHUTDOWN] Setting PID I to 0...');
-        const pidIJson = JSON.stringify({ PID_I: 0 });
+        const pidIJson = JSON.stringify(encodeProtocolCommand({ PID_I: 0 }));
         const pidIPayload = Buffer.from(pidIJson + '\n', 'utf8');
         await new Promise((resolve, reject) => {
           serialPort.write(pidIPayload, (err) => {
@@ -281,7 +329,7 @@ function createWindow() {
 
         // 8. PID D value to 0
         console.log('[SHUTDOWN] Setting PID D to 0...');
-        const pidDJson = JSON.stringify({ PID_D: 0 });
+        const pidDJson = JSON.stringify(encodeProtocolCommand({ PID_D: 0 }));
         const pidDPayload = Buffer.from(pidDJson + '\n', 'utf8');
         await new Promise((resolve, reject) => {
           serialPort.write(pidDPayload, (err) => {
@@ -655,6 +703,7 @@ app.whenReady().then(() => {
   webApp.post('/api/disconnect', async (req, res) => {
     try {
       stopQlHeartbeat();
+      if (autoReconnectTimer) { clearTimeout(autoReconnectTimer); autoReconnectTimer = null; }
       if (serialPort && serialPort.isOpen) {
         await new Promise(resolve => serialPort.close(() => resolve()));
       }
@@ -735,6 +784,10 @@ app.on('window-all-closed', () => {
 
 // Auto-connect to target device
 async function autoConnectToTargetDevice() {
+  if (appShuttingDown || isConnected || reconnectInProgress) {
+    return;
+  }
+
   try {
     const ports = await getPortsWithFallback();
     const targetPort = ports.find(port =>
@@ -899,7 +952,7 @@ async function connectSerial(portPath, baudRate) {
             // Extract complete JSON string
             const jsonString = jsonRxBuffer.substring(jsonStart, jsonEnd + 1);
             try {
-              const jsonData = JSON.parse(jsonString);
+              const jsonData = normalizeProtocolTelemetry(JSON.parse(jsonString));
               
               // Log ALL received JSON for debugging
               console.log('📥 JSON received:', jsonString);
@@ -936,7 +989,7 @@ async function connectSerial(portPath, baudRate) {
               } else if (isMainData || isPidData) {
                 // Send JSON data to renderer
                 sendJsonDataToAllWindows(jsonData);
-                console.log('✅ JSON sent to renderer:', isMainData ? 'Main Data (T,P,F)' : 'PID Data (Pr,It,Dr,Ot)');
+                console.log('✅ JSON sent to renderer:', isMainData ? 'Main Data (SV,PW,A2)' : 'PID Data (PP,PI,PD,PO)');
                 jsonFound = true;
                 // Remove processed JSON from buffer
                 jsonRxBuffer = jsonRxBuffer.substring(jsonEnd + 1);
@@ -991,6 +1044,7 @@ async function connectSerial(portPath, baudRate) {
       stopQlHeartbeat();
       isConnected = false;
       sendConnectionStatusToAllWindows({ connected: false, error: err.message });
+      scheduleAutoReconnect('serial error');
     });
 
     // Open the port
@@ -1188,6 +1242,7 @@ function startConnectionMonitoring() {
         isConnected = false;
         stopQlHeartbeat();
         sendConnectionStatusToAllWindows({ connected: false, error: 'Port closed' });
+        scheduleAutoReconnect('port closed');
         return;
       }
     }
@@ -1217,6 +1272,22 @@ function waitMs(delay) {
   return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
+// Keep retrying the last known COM port after an unplug/power-cycle. The
+// SerialPort error event stops the heartbeat, so recovery must be scheduled
+// independently rather than waiting for another QL failure.
+function scheduleAutoReconnect(reason) {
+  if (appShuttingDown || !activeSerialPath || !activeSerialBaudRate || autoReconnectTimer || reconnectInProgress) {
+    return;
+  }
+  const delay = Math.min(1000 * (2 ** reconnectFailureStreak), 8000);
+  console.log(`[SERIAL] Scheduling auto-reconnect in ${delay}ms (${reason})`);
+  autoReconnectTimer = setTimeout(async () => {
+    autoReconnectTimer = null;
+    const recovered = await recoverSerialConnection();
+    if (!recovered && activeSerialPath) scheduleAutoReconnect('retry failed');
+  }, delay);
+}
+
 const QL_HEARTBEAT_FAILURE_THRESHOLD = 20; // ~2s of continuous 10 Hz failures before attempting recovery
 
 function startQlHeartbeat() {
@@ -1240,7 +1311,7 @@ function startQlHeartbeat() {
       // recoverable on its own — reconnecting immediately aborts any other
       // in-flight write and can spiral into a reconnect storm. Only escalate
       // to a real reconnect after several consecutive failures.
-      const jsonCommand = JSON.stringify({ QL: 1 });
+      const jsonCommand = JSON.stringify(encodeProtocolCommand({ QL: 1 }));
       const payload = Buffer.from(jsonCommand + '\n', 'utf8');
       await writeToSerialWithTimeout(payload, 1500, 'QL heartbeat');
       qlHeartbeatFailureCount = 0;
@@ -1274,6 +1345,10 @@ function stopQlHeartbeat() {
 }
 
 async function recoverSerialConnection() {
+  if (appShuttingDown) {
+    return false;
+  }
+
   if (!activeSerialPath || !activeSerialBaudRate) {
     return false;
   }
@@ -1386,7 +1461,7 @@ async function requestHardwareIdWithRetry(portPath, generation) {
       return;
     }
     try {
-      const jsonCommand = JSON.stringify({ REQ_ID: 1 });
+      const jsonCommand = JSON.stringify(encodeProtocolCommand({ REQ_ID: 1 }));
       const payload = Buffer.from(jsonCommand + '\n', 'utf8');
       await writeToSerialWithTimeout(payload, 1500, `ID request (attempt ${attempt + 1})`);
       console.log(`[TX] ID request (attempt ${attempt + 1}): ${jsonCommand}`);
@@ -1397,7 +1472,7 @@ async function requestHardwareIdWithRetry(portPath, generation) {
 }
 
 async function sendJsonCommand(commandObject, description) {
-  const jsonCommand = JSON.stringify(commandObject);
+  const jsonCommand = JSON.stringify(encodeProtocolCommand(commandObject));
   const payload = Buffer.from(jsonCommand + '\n', 'utf8');
   try {
     await writeToSerialWithTimeout(payload, 1500, description);
@@ -1606,6 +1681,7 @@ ipcMain.handle('connect-to-port', async (event, portPath, baudRate) => {
 ipcMain.handle('disconnect-from-port', async () => {
   try {
     stopQlHeartbeat();
+    if (autoReconnectTimer) { clearTimeout(autoReconnectTimer); autoReconnectTimer = null; }
 
     // Disconnect Serial Port
     if (serialPort && serialPort.isOpen) {
@@ -2793,6 +2869,10 @@ ipcMain.handle('load-hardware-page', (event, type) => {
   const file = HARDWARE_HTML_MAP[type];
   if (!file || !mainWindow) return;
   mainWindow.loadFile(path.join(__dirname, file));
+});
+
+ipcMain.handle('load-hardware-selection', () => {
+  if (mainWindow) mainWindow.loadFile(path.join(__dirname, 'landing.html'));
 });
 
 ipcMain.handle('open-external-url', (event, url) => {

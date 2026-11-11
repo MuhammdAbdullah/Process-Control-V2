@@ -1,5 +1,8 @@
 # Process Control V2
 
+The compact USB JSON protocol shared with the firmware is documented in
+[PROTOCOL.md](PROTOCOL.md).
+
 > Desktop application for multi-sensor laboratory process control, with built-in browser access for tablets and phones on the same network — built by Matrix TSL.
 
 **Version:** `0.1.9` &nbsp;|&nbsp; **Platform:** Windows (Electron desktop) &nbsp;|&nbsp; **License:** MIT
@@ -20,7 +23,7 @@ This app connects to a hardware process controller over Serial or USB HID and pr
 - **Tablet / phone access:** built-in embedded server starts automatically with the desktop app; scan the QR code to open the full UI in any browser on the same network — no installation needed on the tablet
 - **Headless server mode** (`npm run web`) — for lab PCs or Raspberry Pi where no GUI is needed; still requires Node.js + hardware physically connected to the host machine
 - Live SSE data stream — hardware data pushed to all connected browsers in real time
-- **Hardware auto-routing** — app reads `{A: X}` hardware ID on connect and auto-navigates to the matching sensor page
+- **Hardware auto-routing** — app reads `{HW: X}` hardware ID on connect and auto-navigates to the matching sensor page
 
 ---
 
@@ -58,9 +61,61 @@ npm start          # run as Electron desktop app
 
 ---
 
+## USB JSON Protocol
+
+The firmware and app use compact two-character JSON keys. Keeping the names
+short is important because the firmware JSON parser has a 100-byte message
+buffer. Commands are sent from the app to the controller; telemetry is sent
+from the controller to the app.
+
+| Key | Direction | Description |
+|-----|-----------|-------------|
+| `CM` | App → firmware | Control mode: `1` Manual, `2` On/Off, `3` PID. |
+| `SP` | App → firmware | Target setpoint in the active product unit. |
+| `PW` | Both | Primary output power or actuator output, normally `0–100%`. |
+| `A2` | Both | Secondary output, such as fan, pump, reverse drive, or relief output. |
+| `V2` | App → firmware | Secondary valve command: `0` closed/off, `1` open/full. |
+| `HY` | App → firmware | On/Off hysteresis dead-band. |
+| `PP` | Both | PID proportional term or proportional gain. |
+| `PI` | Both | PID integral term or integral gain. |
+| `PD` | Both | PID derivative term or derivative gain. |
+| `PF` | App → firmware | PID update frequency in Hz. |
+| `HB` | App → firmware | Heartbeat/telemetry request. Regular heartbeats prove the USB link is alive. |
+| `HW` | Both | Hardware/product ID, `201–206`. |
+| `PU` | App → firmware | Pressure unit: `0` PSI, `1` mbar. Saved in firmware EEPROM. |
+| `TU` | App → firmware | Temperature unit: `0` Celsius, `1` Fahrenheit. Saved in firmware EEPROM. |
+| `SF` | App → firmware | Sensor calibration scale factor. Default is `1.0`. |
+| `ZS` | App → firmware | Zero/calibrate the active sensor. |
+| `SV` | Firmware → app | Sensor/process value. |
+| `UN` | Firmware → app | Unit flag associated with the sensor value. |
+| `PO` | Firmware → app | Complete PID output value. |
+
+Example control command:
+
+```json
+{"CM":3,"SP":15,"PW":50,"A2":0,"HY":1}
+```
+
+Main telemetry:
+
+```json
+{"SV":8.4,"PW":40,"A2":0,"UN":0}
+```
+
+PID telemetry:
+
+```json
+{"PP":12.5,"PI":8.2,"PD":0,"PO":20}
+```
+
+The complete compact protocol reference is also available in
+[PROTOCOL.md](PROTOCOL.md).
+
+---
+
 ## Sensor Pages
 
-The app opens a landing page on startup and auto-navigates to the correct sensor page based on the `{A: X}` hardware ID broadcast. Six sensor types are supported:
+The app opens a landing page on startup and auto-navigates to the correct sensor page based on the `HW` hardware ID. Six sensor types are supported:
 
 | Hardware ID | Page | Sensor | Unit |
 |-------------|------|--------|------|
@@ -96,7 +151,7 @@ Direct open-loop control — the operator sets output values explicitly with no 
 | Primary | Process variable (temperature, speed, angle, etc.) |
 | Secondary | Output % |
 
-**Hardware command:** `{C: 1, P: <value>, F: <fan>}`
+**Hardware command:** `{CM: 1, PW: <value>, A2: <fan>}`
 
 **Typical use:** commissioning, open-loop characterization, manual override
 
@@ -125,7 +180,9 @@ Hysteresis-based two-state control — the hardware switches the actuator fully 
 | Primary | Process variable, target line, upper hysteresis band, lower hysteresis band |
 | Secondary | Output % |
 
-**Hardware command:** `{C: 2, T: <setpoint>, Y: <hysteresis>, F: <fan>}`
+Pressure displays the relief valve as `OPEN` (`A2=0`) or `CLOSED` (`A2=100`) in Manual and On/Off mode. Pressure CSV exports record `Relief Valve Status` rather than a percentage.
+
+**Hardware command:** `{CM: 2, SP: <setpoint>, HY: <hysteresis>, A2: <fan>}`
 
 **Typical use:** simple regulators, on/off valve control, bang-bang level or speed control
 
@@ -140,7 +197,7 @@ Closed-loop proportional–integral–derivative control — the hardware comput
 - Configure **P**, **I**, and **D** gains individually
 - The app uses the full **PID** controller for every product
 - Set a **PID frequency** (update rate sent to hardware)
-- The hardware streams back PID component values (`Pr`, `It`, `Dr`, `Ot`) each cycle, which are overlaid on the secondary chart
+- The hardware streams back PID component values (`PP`, `PI`, `PD`, `PO`) each cycle, which are overlaid on the secondary chart
 
 **Parameters:**
 | Parameter | Description |
@@ -170,8 +227,8 @@ The selected product's preset is loaded when its page opens and all four values 
 | PID | Proportional + Integral + Derivative | Output, P term, I term, D term |
 
 **Hardware data cycle (two messages per cycle):**
-1. Main data: `{T: <pv>, P: <output>, F: <fan>}`
-2. PID data: `{Pr: <proportional>, It: <integral>, Dr: <derivative>, Ot: <output>}` — PID mode only
+1. Main data: `{SV: <pv>, PW: <output>, A2: <fan>, UN: <unit flag>}`
+2. PID data: `{PP: <proportional>, PI: <integral>, PD: <derivative>, PO: <output>}` — PID mode only
 
 The renderer stores the PID message in `lastPidValues` and merges it with the next main data message when plotting.
 
@@ -183,12 +240,12 @@ The renderer stores the PID message in `lastPidValues` and merges it with the ne
 
 **Hardware commands:**
 ```json
-{ "C": 3 }                   // switch to PID mode
-{ "PID_P": 3.162 }           // set proportional gain
-{ "PID_I": 0.01  }           // set integral gain
-{ "PID_D": 150   }           // set derivative gain
-{ "T": 45        }           // set target setpoint
-{ "F": 50        }           // set fan speed
+{ "CM": 3 }                  // switch to PID mode
+{ "PP": 3.162 }              // set proportional gain
+{ "PI": 0.01  }              // set integral gain
+{ "PD": 150   }              // set derivative gain
+{ "SP": 45 }                 // set target setpoint
+{ "A2": 50 }                 // set secondary output
 ```
 
 **Default gains:** `P = 3.162`, `I = 0.01`, `D = 150` (factory defaults; user-saved values persist in `localStorage`)
@@ -199,17 +256,23 @@ The renderer stores the PID message in `lastPidValues` and merges it with the ne
 
 ## Shared Hardware Page Safety
 
-`pressure.html`, `level.html`, `flow.html`, `servo-speed.html`, and `servo-angle.html` use `renderer-hardware.js`. On first connection and every control-mode switch, the shared renderer resets the page to a safe idle state before sending the mode command. Brief USB reconnects preserve the current control mode instead of forcing Manual, so a heartbeat hiccup cannot silently switch the operator out of PID. When entering PID, the app sends `W:2` to clear the firmware integral accumulator once and sends the selected product's stored PID preset. The PID `Reset` button restores that preset and sends it immediately. For `P`, `F`, and `T`, the renderer sends a brief nonzero force-update command before the final safe value so firmware cached-value checks cannot leave a physical output running.
+`pressure.html`, `level.html`, `flow.html`, `servo-speed.html`, and `servo-angle.html` use `renderer-hardware.js`. On first connection and every control-mode switch, the shared renderer resets the page to a safe idle state before sending the mode command. Brief USB reconnects preserve the current control mode instead of forcing Manual, so a heartbeat hiccup cannot silently switch the operator out of PID. When entering PID, the app sends `IR:2` to clear the firmware integral accumulator once and sends the selected product's stored PID preset. On the Pressure page, the PID sidebar toggle sends `IR:1` to enable anti-windup clamping or `IR:2` to temporarily disable clamping and reset the integral for controlled experiments. The PID `Reset` button restores that preset and sends it immediately. For `PW`, `A2`, and `SP`, the renderer sends a brief nonzero force-update command before the final safe value so firmware cached-value checks cannot leave a physical output running.
+
+### Pressure Units
+
+Pressure units are selected in the Pressure Admin settings. `PSI` is flag `0`; `mbar` is flag `1`. The app sends `{ "PU": 0 }` or `{ "PU": 1 }`, while firmware stores the setting at EEPROM address `28` and converts calibrated pressure before control, telemetry, charts, CSV export, and the touch graph. Firmware telemetry includes `UN` so the app can resynchronize after reconnect.
+
+Pressure, Level, and Flow each have a product-specific sensor calibration scale factor in Admin → Settings. It defaults to `1.0`; the app sends `{ "SF": <factor> }` and firmware stores it at EEPROM address `32`. Pressure and Level apply the factor to the firmware sensor value before control and telemetry. Flow applies the factor to the incoming sensor value in the app; actuator output scaling is unchanged.
 
 | Page | UI reset | Commands sent before mode command |
 |------|----------|-----------------------------------|
-| Pressure | Pump `0`, target `0 PSI`, relief valve `0`, valve button closed | `{H:0}`, `{F:1}`, `{F:0}`, `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
-| Level | Pump `0`, target `0 mm`, valve `0` | `{F:1}`, `{F:0}`, `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
-| Flow | Pump `0`, target `0 L/hr`, valve `0` | `{F:1}`, `{F:0}`, `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
-| Servo Speed | Drive `0`, target `0 RPM` | `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
-| Servo Angle | Drive `0`, target `0°` | `{P:1}`, `{P:0}`, `{T:1}`, `{T:0}` |
+| Pressure | Pump `0`, target `0` in the selected pressure unit, relief valve open | `{V2:1}`, `{A2:1}`, `{A2:0}`, `{PW:1}`, `{PW:0}`, `{SP:1}`, `{SP:0}` |
+| Level | Pump `0`, target `0 mm`, valve `0` | `{A2:1}`, `{A2:0}`, `{PW:1}`, `{PW:0}`, `{SP:1}`, `{SP:0}` |
+| Flow | Pump `0`, target `0 L/hr`, valve `0` | `{A2:1}`, `{A2:0}`, `{PW:1}`, `{PW:0}`, `{SP:1}`, `{SP:0}` |
+| Servo Speed | Drive `0`, target `0 RPM` | `{PW:1}`, `{PW:0}`, `{SP:1}`, `{SP:0}` |
+| Servo Angle | Drive `0`, target `0°` | `{PW:1}`, `{PW:0}`, `{SP:1}`, `{SP:0}` |
 
-For pressure, `H` is a binary relief-valve alias handled by firmware: `0 = closed/off`, `1 = open/full`. Flow and Level use the analog `F` valve output instead.
+For pressure, `V2` is a binary relief-valve alias handled by firmware: `0 = closed/off`, `1 = open/full`. Flow and Level use the analog `A2` valve output instead.
 
 ---
 
@@ -226,7 +289,7 @@ Controls and monitors the rotational speed of a servo motor.
 | Sensor label | Speed |
 | Unit | RPM |
 | Sensor range | 0–60 RPM |
-| Primary output key | `P` (Drive) |
+| Primary output key | `PW` (Drive) |
 | Output range | −50 to +50 |
 | Secondary output | None |
 
@@ -243,7 +306,7 @@ Controls and monitors the angular position of a servo.
 | Sensor label | Angle |
 | Unit | ° (degrees) |
 | Sensor range | −180° to +180° |
-| Primary output key | `P` (Drive) |
+| Primary output key | `PW` (Drive) |
 | Output range | −50 to +50 |
 | Secondary output | None |
 
@@ -293,21 +356,22 @@ Commands sent to hardware:
 
 | Key | Value | Meaning |
 |-----|-------|---------|
-| `C` | `1 / 2 / 3` | Control mode: Manual / On/Off / PID |
-| `P` | `0–100` (or device range) | Primary output (heater power %, drive, etc.) |
-| `F` | `0–100` | Fan / secondary output % |
-| `T` | setpoint value | Target setpoint |
-| `Y` | `1–10` | Hysteresis (On/Off mode, device units) |
-| `PID_P / PID_I / PID_D` | numeric | PID gains |
-| `H` | `0 / 1` | Binary valve/heater-style off/on command; currently used by Pressure as relief valve closed/open |
-| `A` | hardware ID | Hardware type identifier (sent by device on connect) |
+| `CM` | `1 / 2 / 3` | Control mode: Manual / On/Off / PID |
+| `PW` | `0–100` (or device range) | Primary output (heater power %, drive, etc.) |
+| `A2` | `0–100` | Fan / secondary output % |
+| `SP` | setpoint value | Target setpoint |
+| `HY` | `1–10` | Hysteresis (On/Off mode, device units) |
+| `PP / PI / PD / PF` | numeric | PID gains and update frequency |
+| `V2` | `0 / 1` | Pressure relief valve command: `1` opens the valve, `0` closes it |
+| `SF` | positive float | Product sensor calibration multiplier; default `1.0` |
+| `HW` | hardware ID | Hardware type identifier (sent by device on connect) |
 
 Incoming data arrives as **two separate JSON messages per cycle**:
 
-1. **Main data:** `{"T": 25.5, "P": 45.2, "F": 50}` — process variable, output, secondary output
-2. **PID data:** `{"Pr": 5.67, "It": 2.89, "Dr": 1.23, "Ot": 12.34}` — PID component values (PID mode only)
+1. **Main data:** `{"SV": 25.5, "PW": 45.2, "A2": 50, "UN": 0}` — process variable, output, secondary output, unit flag
+2. **PID data:** `{"PP": 5.67, "PI": 2.89, "PD": 1.23, "PO": 12.34}` — PID component values (PID mode only)
 
-Hardware also sends intermediate `{T}`-only packets between full cycles; these are buffered in `pendingIntermediateTPackets` and flushed equally distributed when the next full `{T, P, F}` message arrives.
+Hardware also sends intermediate `{SV}`-only packets between full cycles; these are buffered in `pendingIntermediateTPackets` and flushed equally distributed when the next full `{SV, PW, A2}` message arrives.
 
 Command writes are **throttled to a 40 ms minimum interval** to avoid serial flooding.
 
@@ -339,7 +403,7 @@ The other sensor pages (`pressure.html`, `flow.html`, `level.html`, `servo-speed
 ## Safety & Reliability
 
 - **On connect:** hardware initialization sequence sent automatically
-- **On close:** safe shutdown sequence — sets `C=1`, `F=0`, `P=0`, `H=0`, PID gains = `0`; setpoint is `T=20` on Temperature and `T=0` on non-temperature pages
+- **On close:** safe shutdown sequence — sets `CM=1`, `A2=0`, `PW=0`, and for Pressure sends `V2=1` to open the relief valve; PID gains = `0`; setpoint is `SP=20` on Temperature and `SP=0` on non-temperature pages
 - **On mode switch:** Temperature sends its safe reset sequence; shared hardware pages reset visible controls and send page-specific minimum/off commands before the new mode
 - **On reconnect:** first connection safe-initializes to Manual; later brief reconnects preserve the active control mode and skip one chart point to avoid a visual jump
 - **40 ms minimum command write interval** to avoid serial flooding
@@ -430,7 +494,7 @@ Context isolation is enabled. `preload.js` exposes only a narrow `window.electro
 | [renderer-hardware.js](renderer-hardware.js) | Shared renderer for Pressure, Flow, Level, Servo Speed, and Servo Angle pages; driven by `window.HARDWARE_CONFIG` |
 | [layout.js](layout.js) | Clock, mode toggle, live reading display sync |
 | [server.js](server.js) | Standalone Express server for web/tablet deployment |
-| [landing.html](landing.html) | Startup landing page — hardware status banner + auto-routing on `{A: X}` |
+| [landing.html](landing.html) | Startup landing page — hardware status banner + auto-routing on `{HW: X}` |
 | [index.html](index.html) | Temperature sensor page; also hosts the Admin Panel and Curriculum worksheets as sidebar-switched sub-pages |
 | [pressure.html](pressure.html) | Pressure sensor page |
 | [flow.html](flow.html) | Flow sensor page |

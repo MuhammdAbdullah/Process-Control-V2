@@ -121,6 +121,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Navigate to a different hardware frontend (reloads the main window)
   loadHardwarePage: (type) => ipcRenderer.invoke('load-hardware-page', type),
+  loadHardwareSelection: () => ipcRenderer.invoke('load-hardware-selection'),
 
   // Fired when hardware broadcasts its type ID via {A: X} on connect
   onHardwareIdReceived: (callback) => {

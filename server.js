@@ -13,6 +13,25 @@ const TARGET_PRODUCT_ID = '0113';
 const SERIAL_MIN_COMMAND_INTERVAL_MS = 40;
 const QL_HEARTBEAT_INTERVAL_MS = 100; // 10 Hz telemetry requests for fast Level response logging.
 
+const PROTOCOL_COMMAND_KEYS = Object.freeze({
+    C: 'CM', T: 'SP', P: 'PW', F: 'A2', H: 'V2', Y: 'HY',
+    PID_P: 'PP', PID_I: 'PI', PID_D: 'PD', PID_Hz: 'PF',
+    QL: 'HB', W: 'IR', K: 'TU', U: 'PU', SF: 'SF',
+    A: 'HW', REQ_ID: 'RQ', Z: 'ZS'
+});
+
+function encodeProtocolCommand(commandObject) {
+    return Object.fromEntries(Object.entries(commandObject).map(([key, value]) => [
+        PROTOCOL_COMMAND_KEYS[key] || key,
+        value
+    ]));
+}
+
+function normalizeProtocolTelemetry(jsonData) {
+    const keyMap = { SV: 'T', PW: 'P', A2: 'F', UN: 'U', HW: 'A', PP: 'Pr', PI: 'It', PD: 'Dr', PO: 'Ot' };
+    return Object.fromEntries(Object.entries(jsonData).map(([key, value]) => [keyMap[key] || key, value]));
+}
+
 // Serial state
 let serialPort = null;
 let isConnected = false;
@@ -162,7 +181,7 @@ function queueSerialWrite(task) {
 }
 
 async function sendJsonCommand(commandObj, description) {
-    const jsonStr = JSON.stringify(commandObj);
+    const jsonStr = JSON.stringify(encodeProtocolCommand(commandObj));
     const payload = Buffer.from(jsonStr + '\n', 'utf8');
     await queueSerialWrite(async () => {
         if (!serialPort || !serialPort.isOpen) throw new Error('Not connected');
@@ -203,7 +222,7 @@ function handleSerialData(data) {
 
             const jsonStr = jsonRxBuffer.substring(jsonStart, jsonEnd + 1);
             try {
-                const parsed = JSON.parse(jsonStr);
+                const parsed = normalizeProtocolTelemetry(JSON.parse(jsonStr));
                 const isMain = 'T' in parsed && 'P' in parsed && 'F' in parsed;
                 const isPid  = 'Pr' in parsed || 'It' in parsed || 'Dr' in parsed || 'Ot' in parsed;
                 if (isMain || isPid) {
